@@ -572,8 +572,8 @@
     const uniqueLinks = links.filter(l => seen.has(l.href) ? false : (seen.add(l.href), true));
 
     const KW = {
-      policy: ['политик','конфиденц','персональн','privacy','cookie','данных'],
-      offer:  ['оферт','договор','правила','усло','public-offer'],
+      policy: ['политик','конфиденц','персональн','privacy','cookie','данных','gdpr','обработк','согласие','пд','personal-data','persdata','privacy-policy','/policy'],
+      offer:  ['оферт','договор','правила','усло','public-offer','соглашен','agreement','terms'],
       ret:    ['возврат','обмен','отказ'],
       about:  ['о компани','о нас','контакт','about','contact','реквизит']
     };
@@ -1106,6 +1106,36 @@
     renderResults({ mode: 'full', origin, hostname, pages, aiData, source: urlList.source, egrul, stats });
   }
 
+  // Пытается найти политику по типовым URL-путям, если ссылок в DOM не нашлось
+  // или текст оказался слишком коротким (SPA-оболочка, нестандартный текст линка).
+  // Возвращает [{url, text}] или [] если нигде не получилось.
+  async function discoverPolicyByCommonPaths(originUrl) {
+    if (scanCancelled) return [];
+    let origin;
+    try { origin = new URL(originUrl).origin; } catch (e) { return []; }
+    const candidates = [
+      '/privacy', '/privacy-policy', '/policy',
+      '/legal/privacy', '/legal/privacy-policy', '/info/privacy',
+      '/about/privacy', '/static/privacy', '/static-pages/privacy',
+      '/policies/privacy', '/privacy.html', '/privacy.shtml',
+      '/personal-data', '/persdata',
+    ];
+    const results = await Promise.all(candidates.map(p => fetchUrl(origin + p)));
+    if (scanCancelled) return [];
+    const found = results
+      .filter(r => r && r.ok && r.text && r.text.length > 500)
+      .filter(r => {
+        const t = r.text.toLowerCase();
+        // Sanity: страница похожа на политику
+        return t.includes('персональн') || t.includes('privacy') ||
+               t.includes('конфиденц')   || t.includes('обработк');
+      });
+    if (found.length === 0) return [];
+    // Самая длинная страница = наиболее полная политика
+    found.sort((a, b) => b.text.length - a.text.length);
+    return [{ url: found[0].url, text: found[0].text.slice(0, 50000) }];
+  }
+
   // ── AI-арбитр для 152-ФЗ: подтверждает пункты, которые локальный чек не нашёл ──
   // Вызывается ТОЛЬКО при неуверенном результате (1 ≤ found ≤ 5). Никогда не понижает статус.
   async function verify152FZWithAI(policyText, result152) {
@@ -1202,6 +1232,14 @@
       tag(c.offerLinks, 'offer', 3000);
       tag(c.returnLinks, 'return', 3000);
       tag(c.aboutLinks, 'about', 3000);
+    }
+
+    // Fallback: политики нет или текст подозрительно короткий (SPA-оболочка,
+    // нестандартный текст линка) — пробуем типовые URL-пути на origin сайта.
+    const initialPolicyText = (fetched.policy || []).map(p => p.text).join('\n');
+    if (initialPolicyText.length < 500 && !scanCancelled) {
+      const fallbackPolicy = await discoverPolicyByCommonPaths(c.url);
+      if (fallbackPolicy.length > 0) fetched.policy = fallbackPolicy;
     }
 
     let msg = `URL: ${c.url}\nЗаголовок: ${c.title}\n\nШАПКА: ${c.header}\nПОДВАЛ: ${c.footer}\n\nТЕКСТ:\n${c.bodyText}\n\nTracking: ${c.hasAdScripts?'ЕСТЬ':'нет'}\nCookie-баннер: ${c.hasCookieBanner?'ЕСТЬ':'нет'}\n`;
