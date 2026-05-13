@@ -214,57 +214,118 @@
     }
     const t = policyText.toLowerCase();
 
+    // Section-aware первый проход: заголовки разделов гарантируют пункт.
+    // Ищем "1. Категории...", "2.1 Цели...", "Раздел 5. Права субъекта" и т.п.
+    const sectionHeadingHits = {
+      categories:     /(?:^|\n|\d+\.\s*|раздел\s+\d+[\.\s]+)[^.\n]{0,30}категори[ийяю][^.\n]{0,40}(перс|субъект|данн|обрабатыва)/i,
+      purposes:       /(?:^|\n|\d+\.\s*|раздел\s+\d+[\.\s]+)[^.\n]{0,30}цел[ьеияю][^.\n]{0,40}(обработк|сбор|использ)/i,
+      legal_basis:    /(?:^|\n|\d+\.\s*|раздел\s+\d+[\.\s]+)[^.\n]{0,30}(правов[ыоае]+\s+основан|основани[яею]\s+обработ|основан[ияе]\s+для\s+обработ)/i,
+      storage_term:   /(?:^|\n|\d+\.\s*|раздел\s+\d+[\.\s]+)[^.\n]{0,30}срок[аи]?\s+(хранен|обработк|обрабатыва)/i,
+      subject_rights: /(?:^|\n|\d+\.\s*|раздел\s+\d+[\.\s]+)[^.\n]{0,30}прав[аоеыхими]+\s+субъект/i,
+      contact:        /(?:^|\n|\d+\.\s*|раздел\s+\d+[\.\s]+)[^.\n]{0,30}(контакт|реквизит|связ[аь]|обратн[аоы][яе])/i,
+      third_parties:  /(?:^|\n|\d+\.\s*|раздел\s+\d+[\.\s]+)[^.\n]{0,30}(передач[аеиу]\s+(данн|перс)|треть[ьиим]+\s+лиц)/i,
+    };
+
     const checks = [
       {
         id: 'categories',
         label: 'Категории субъектов и персональных данных',
-        patterns: [/категори[яийю]\s+(перс|субъект)/, /перечень.{0,30}(перс|данн)/, /собира[еют]м.{0,30}(данн|сведени)/, /(ф\.?и\.?о\.?|фамилия|имя)\s*,?\s*(телефон|email|почт)/],
-        keywords: ['категории персональных', 'перечень персональных', 'обрабатываемые персональные']
+        patterns: [
+          /категори[яийюях]+\s+(перс|субъект|обрабатываем|данн)/,
+          /перечень.{0,30}(перс|данн|сведени)/,
+          /собира[еютюм]+.{0,30}(данн|сведени|информац)/,
+          /обрабатыва[еютюмющ]+.{0,40}(данн|сведени|информац)/,
+          /(ф\.?и\.?о\.?|фамили[яию]|имя|отчеств)\s*,?\s*(телефон|email|e-?mail|почт|адрес)/,
+          /(телефон|email|e-?mail).{0,20}(адрес|почт|номер)/,
+        ],
+        keywords: ['категории персональных', 'перечень персональных', 'обрабатываемые персональные', 'категории обрабатываемых', 'состав персональных данных', 'виды персональных данных']
       },
       {
         id: 'purposes',
         label: 'Цели обработки персональных данных',
-        patterns: [/цел[ьейяи]\s+обработк/, /(оператор|компани).{0,40}(в\s+целях|для\s+цел)/, /цел[ьею]\s+(обработ|сбор)/],
-        keywords: ['цели обработки', 'в целях', 'для целей', 'с целью']
+        patterns: [
+          /цел[ьейяиюях]+\s+обработк/,
+          /цел[ьейяиюях]+\s+(сбор|использован|хранен)/,
+          /обработк[аиеу]\s+осуществля[еюя]тся\s+в\s+цел/,
+          /(оператор|компани|сайт).{0,60}(в\s+целях|для\s+цел|с\s+целью|преследует\s+цел)/,
+          /цел[ьею]\s*[—\-:]\s*(обработ|сбор|информирован)/,
+        ],
+        keywords: ['цели обработки', 'в целях', 'для целей', 'с целью', 'целями обработки', 'целью обработки', 'для следующих целей']
       },
       {
         id: 'legal_basis',
         label: 'Правовое основание обработки',
-        patterns: [/правов(ое|ого|ом)\s+основани/, /(на\s+основании|в\s+соответствии).{0,80}152/, /(152.{0,3}ФЗ|федеральн.{0,15}закон.{0,15}152)/i, /(согласие|договор)\s+(является|служит|выступает)\s+основа/],
-        keywords: ['правовое основание', '152-ФЗ', 'согласие субъекта']
+        patterns: [
+          /правов[ыоаеми]+\s+основани[ея]?/,
+          /основани[еяюий]+\s+(обработк|для\s+обработ)/,
+          /(на\s+основании|в\s+соответствии|согласно).{0,80}152/,
+          /(152.{0,5}ФЗ|федеральн.{0,20}закон.{0,20}152|закон.{0,15}о\s+персональных)/i,
+          /(согласи[еяю]|договор|конституц).{0,40}(является|служит|выступает|являются).{0,20}основа/,
+          /правовы[ехми]+\s+основани[яей]/,
+        ],
+        keywords: ['правовое основание', 'правовых основаниях', '152-фз', 'фз-152', 'согласие субъекта', 'согласие на обработку', 'статья 6']
       },
       {
         id: 'storage_term',
         label: 'Срок обработки и хранения',
-        patterns: [/срок[аи]?\s+(хранен|обработ)/, /(хран[яеи]т|обрабатыва[еют]т)\s+(в\s+течени|до|на\s+протяжении)/, /(удал[яе]ются|уничтожаются)\s+(после|по\s+истечен|через)/, /срок.{0,30}(года?|месяц|дней?)/],
-        keywords: ['срок хранения', 'срок обработки', 'хранятся в течение', 'до достижения целей']
+        patterns: [
+          /срок[аиовм]*\s+(хранен|обработк|обрабатыва)/,
+          /(хран[яеитсю]+|обрабатыва[еютсюя]+)\s+(в\s+течени|до|на\s+протяжении|пока)/,
+          /(удал[яеютсюя]+|уничтожа[еютсюя]+)\s+(после|по\s+истечен|через|по\s+достижени)/,
+          /срок.{0,40}(года?|лет|месяц|дн[яей]+|недел)/,
+          /(до\s+достижения|по\s+достижении).{0,40}цел/,
+          /хран[яеитсю]+.{0,30}не\s+более/,
+        ],
+        keywords: ['срок хранения', 'срок обработки', 'сроки хранения', 'сроков хранения', 'хранятся в течение', 'до достижения целей', 'по достижении целей', 'в течение срока']
       },
       {
         id: 'subject_rights',
         label: 'Права субъекта персональных данных',
-        patterns: [/прав[аоеыхы]?\s+субъект/, /субъект\s+(имеет|вправе)\s+прав/, /прав[ао]\s+на\s+(доступ|удален|изменен|отзыв)/, /отзыв\s+согласи/],
-        keywords: ['права субъекта', 'право на доступ', 'право на удаление', 'отзыв согласия', 'право обратиться']
+        patterns: [
+          /прав[аоеыхими]+\s+субъект/,
+          /субъект.{0,30}(имеет|вправе|может)\s+(прав|потребова|запрос)/,
+          /прав[ао]\s+(на\s+)?(доступ|удален|изменен|отзыв|уточнен|блокирован)/,
+          /(право|возможность)\s+(отозвать|обратиться|потребовать|запросить)/,
+          /отзыв\s+согласи/,
+          /вправе\s+(отозвать|потребовать|запросить|обратиться)/,
+        ],
+        keywords: ['права субъекта', 'правах субъекта', 'право на доступ', 'право на удаление', 'отзыв согласия', 'отозвать согласие', 'право обратиться', 'вправе отозвать', 'право на уточнение']
       },
       {
         id: 'contact',
         label: 'Контакты ответственного за обработку',
-        patterns: [/(ответствен[ныйогом]+\s+за\s+(обработ|защит))/, /(адрес|email|e-mail|телефон|тел\.).{0,80}(обраб|защит|оператор)/, /(оператор|компани).{0,100}(@|почт[аеуы]\s+электронн)/, /[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/i],
-        keywords: ['ответственный за обработку', 'обратиться к нам', 'связаться с нами по']
+        patterns: [
+          /ответствен[ныйогомеи]+\s+за\s+(обработк|защит|организац)/,
+          /(адрес|email|e-?mail|телефон|тел\.?).{0,100}(обраб|защит|оператор|персональн)/,
+          /(оператор|компани).{0,150}(@|почт[аеуыой]\s+электронн|электронн[аоы][яе]\s+почт)/,
+          /[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/i,
+          /(контакт|связ[аь])[а-я]{0,10}\s+(оператор|с\s+нами|для\s+связи)/,
+          /(\+7|8)[\s\(]*\d{3}[\s\)\-]*\d{3}[\s\-]*\d{2}[\s\-]*\d{2}/,
+        ],
+        keywords: ['ответственный за обработку', 'обратиться к нам', 'связаться с нами', 'контакты оператора', 'контактная информация', 'для связи', 'наши контакты', 'email:', 'e-mail:', 'электронная почта']
       },
       {
         id: 'third_parties',
         label: 'Передача данных третьим лицам',
-        patterns: [/треть[ьи]?м\s+лиц/, /(передач[аи]|переда[еют]м)\s+(данн|перс|сведени).{0,100}(треть|сторонн|партн)/, /трансгранич/, /(не\s+перед[ам]|без\s+согласи).{0,40}треть/],
-        keywords: ['третьим лицам', 'передача данных', 'трансграничная передача', 'третьи лица']
+        patterns: [
+          /треть[ьиими]+\s+лиц/,
+          /треть.{0,3}лиц/,
+          /(передач[аеиую]|переда[еютюся]+).{0,100}(треть|сторонн|партн|контрагент)/,
+          /трансгранич/,
+          /(не\s+перед[аеютюся]+|без\s+согласи).{0,50}треть/,
+          /(раскрыти[еюй]|предоставлени[еюй]).{0,40}(треть|сторонн)/,
+        ],
+        keywords: ['третьим лицам', 'третьих лиц', 'третьими лицами', 'передача данных', 'трансграничная передача', 'третьи лица', 'передаче данных']
       }
     ];
 
     const result = { items: [], found: 0, total: 7, status: 'unknown' };
     for (const c of checks) {
+      const hasSection = sectionHeadingHits[c.id] && sectionHeadingHits[c.id].test(policyText);
       const hasPattern = c.patterns.some(p => p.test(t));
       const hasKeyword = c.keywords.some(k => t.includes(k.toLowerCase()));
-      const present = hasPattern || hasKeyword;
-      result.items.push({ id: c.id, label: c.label, present });
+      const present = hasSection || hasPattern || hasKeyword;
+      result.items.push({ id: c.id, label: c.label, present, confirmedBy: present ? 'local' : null });
       if (present) result.found++;
     }
 
@@ -746,6 +807,7 @@
     .sz-152-row{display:grid;grid-template-columns:18px 1fr;gap:8px;align-items:center;font-family:'Courier New',monospace;font-size:11px;padding:2px 0}
     .sz-152-icon{font-weight:700;font-size:12px;text-align:center}
     .sz-152-icon.ok{color:#4ade80}
+    .sz-152-icon.ai{color:#60a5fa}
     .sz-152-icon.miss{color:#f87171}
     .sz-152-label{color:#94a3b8}
     .sz-152-label.miss{color:#f87171;text-decoration:line-through;text-decoration-color:rgba(239,68,68,.4)}
@@ -1032,23 +1094,102 @@
     renderResults({ mode: 'full', origin, hostname, pages, aiData, source: urlList.source, egrul, stats });
   }
 
+  // ── AI-арбитр для 152-ФЗ: подтверждает пункты, которые локальный чек не нашёл ──
+  // Вызывается ТОЛЬКО при неуверенном результате (1 ≤ found ≤ 5). Никогда не понижает статус.
+  async function verify152FZWithAI(policyText, result152) {
+    if (!policyText || result152.found >= 6 || result152.found === 0 || result152.status === 'no_policy') {
+      return result152;
+    }
+    if (scanCancelled) return result152;
+
+    const missing = result152.items.filter(i => !i.present);
+    if (missing.length === 0) return result152;
+
+    const policySnippet = policyText.slice(0, 30000);
+
+    const system = `Ты эксперт по 152-ФЗ. Тебе дан текст политики конфиденциальности и список обязательных пунктов ст. 18.1, которые локальный регулярный поиск НЕ нашёл. Твоя задача: для КАЖДОГО пункта решить — есть ли он на самом деле в тексте политики.
+
+Правила:
+- present: true — если пункт явно присутствует в тексте, пусть и сформулирован нестандартно
+- present: false — если пункта действительно нет
+- quote — короткий фрагмент (15-60 симв.) из политики, доказывающий наличие пункта (только если present: true)
+- Не придумывай. Сомневаешься — false.
+
+Верни ТОЛЬКО JSON, без пояснений:
+{"items":[{"id":"<id>","present":true|false,"quote":"<фрагмент>"}, ...]}`;
+
+    const user = `ПУНКТЫ ДЛЯ ПРОВЕРКИ:\n${missing.map(m => `- ${m.id}: ${m.label}`).join('\n')}\n\nТЕКСТ ПОЛИТИКИ:\n${policySnippet}`;
+
+    return new Promise(resolve => {
+      GM_xmlhttpRequest({
+        method: 'POST',
+        url: 'https://api.groq.com/openai/v1/chat/completions',
+        timeout: 15000,
+        headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + GROQ_KEY },
+        data: JSON.stringify({
+          model: 'llama-3.3-70b-versatile',
+          max_tokens: 600,
+          temperature: 0,
+          messages: [
+            { role: 'system', content: system },
+            { role: 'user', content: user }
+          ]
+        }),
+        onload(r) {
+          try {
+            const j = JSON.parse(r.responseText);
+            if (j.error) return resolve(result152);
+            const txt = j.choices?.[0]?.message?.content || '';
+            const m = txt.match(/\{[\s\S]*\}/);
+            if (!m) return resolve(result152);
+            const parsed = JSON.parse(m[0]);
+            const aiItems = Array.isArray(parsed.items) ? parsed.items : [];
+
+            // Применяем только подтверждения. Никогда не отбираем уже найденное локально.
+            const updatedItems = result152.items.map(item => {
+              if (item.present) return item;
+              const aiHit = aiItems.find(a => a && a.id === item.id && a.present === true);
+              if (aiHit) {
+                return { ...item, present: true, confirmedBy: 'ai', quote: String(aiHit.quote || '').slice(0, 200) };
+              }
+              return item;
+            });
+
+            const updated = { ...result152, items: updatedItems };
+            updated.found = updatedItems.filter(i => i.present).length;
+            if (updated.found >= 6) updated.status = 'ok';
+            else if (updated.found >= 3) updated.status = 'risk';
+            else updated.status = 'violation';
+            updated.aiVerified = true;
+            resolve(updated);
+          } catch (e) {
+            resolve(result152); // fail-safe
+          }
+        },
+        onerror() { resolve(result152); },
+        ontimeout() { resolve(result152); }
+      });
+    });
+  }
+
   async function runAIAnalysis(c, egrul) {
     // Загружаем подстраницы политики/оферты для AI
     const allLinks = [...c.policyLinks, ...c.offerLinks, ...c.returnLinks, ...c.aboutLinks];
     const fetched = {};
     if (allLinks.length > 0) {
       const results = await Promise.all(allLinks.map(l => fetchUrl(l.href)));
-      const tag = (links, label) => {
+      // Для политики храним полный текст (нужен check152FZ); остальное обрезаем до 3000.
+      const tag = (links, label, limit) => {
         const r = links.map(l => {
           const f = results.find(x => x.url === l.href);
-          return f && f.ok ? { url: l.href, text: f.text.slice(0, 3000) } : null;
+          return f && f.ok ? { url: l.href, text: f.text.slice(0, limit) } : null;
         }).filter(Boolean);
         if (r.length > 0) fetched[label] = r;
       };
-      tag(c.policyLinks, 'policy');
-      tag(c.offerLinks, 'offer');
-      tag(c.returnLinks, 'return');
-      tag(c.aboutLinks, 'about');
+      tag(c.policyLinks, 'policy', 50000);
+      tag(c.offerLinks, 'offer', 3000);
+      tag(c.returnLinks, 'return', 3000);
+      tag(c.aboutLinks, 'about', 3000);
     }
 
     let msg = `URL: ${c.url}\nЗаголовок: ${c.title}\n\nШАПКА: ${c.header}\nПОДВАЛ: ${c.footer}\n\nТЕКСТ:\n${c.bodyText}\n\nTracking: ${c.hasAdScripts?'ЕСТЬ':'нет'}\nCookie-баннер: ${c.hasCookieBanner?'ЕСТЬ':'нет'}\n`;
@@ -1079,7 +1220,9 @@
       msg += `═══════════════════════════════════════════\n`;
     }
 
-    if (fetched.policy) msg += `\n=== ПОЛИТИКА ===\n${fetched.policy.map(p => `${p.url}\n${p.text}`).join('\n---\n')}\n`;
+    // Для AI-промпта политику урезаем до 3000 симв./шт. — контекст модели ограничен.
+    // Для check152FZ ниже используем ПОЛНЫЙ текст (хранится в fetched.policy[i].text).
+    if (fetched.policy) msg += `\n=== ПОЛИТИКА ===\n${fetched.policy.map(p => `${p.url}\n${p.text.slice(0, 3000)}`).join('\n---\n')}\n`;
     else msg += `\n[ПОЛИТИКА: не найдена]\n`;
     if (fetched.offer) msg += `\n=== ОФЕРТА ===\n${fetched.offer.map(p => `${p.url}\n${p.text.slice(0,1500)}`).join('\n---\n')}\n`;
     else msg += `\n[ОФЕРТА: не найдена]\n`;
@@ -1087,7 +1230,12 @@
 
     // ── Локальный чек-лист 152-ФЗ ст.18.1 (7 пунктов) ──
     const policyText = (fetched.policy || []).map(p => p.text).join('\n\n');
-    const result152 = check152FZ(policyText);
+    let result152 = check152FZ(policyText);
+    // AI-арбитр: если локально найдено 1-5 из 7 — спрашиваем модель по каждому пропущенному пункту.
+    // Никогда не понижает статус, только дополняет. При ошибке/таймауте — возвращает локальный результат.
+    if (result152.status !== 'no_policy' && result152.found >= 1 && result152.found < 6) {
+      result152 = await verify152FZWithAI(policyText, result152);
+    }
     if (result152.status !== 'no_policy') {
       msg += `\n═══ ЛОКАЛЬНЫЙ ЧЕК-ЛИСТ 152-ФЗ ст.18.1 ═══\n`;
       msg += `Найдено пунктов: ${result152.found} из ${result152.total}\n`;
@@ -1429,17 +1577,27 @@
                   r.status === 'risk' ? `Политика неполная (${r.found} из ${r.total})` :
                   `Критические пробелы (${r.found} из ${r.total})`;
 
-    const items = r.items.map(item =>
-      `<div class="sz-152-row">
-        <span class="sz-152-icon ${item.present ? 'ok' : 'miss'}">${item.present ? '✓' : '✗'}</span>
-        <span class="sz-152-label ${item.present ? '' : 'miss'}">${item.label}</span>
-      </div>`
-    ).join('');
+    const items = r.items.map(item => {
+      const isAi = item.present && item.confirmedBy === 'ai';
+      const iconChar = item.present ? (isAi ? '◆' : '✓') : '✗';
+      const iconCls = item.present ? (isAi ? 'ai' : 'ok') : 'miss';
+      const titleAttr = isAi && item.quote ? ` title="Подтверждено AI: «${escapeHtml(item.quote)}»"` : '';
+      return `<div class="sz-152-row"${titleAttr}>
+        <span class="sz-152-icon ${iconCls}">${iconChar}</span>
+        <span class="sz-152-label ${item.present ? '' : 'miss'}">${escapeHtml(item.label)}${isAi ? ' <span style="font-family:\'Courier New\',monospace;font-size:9px;color:#60a5fa">· AI</span>' : ''}</span>
+      </div>`;
+    }).join('');
 
     const missingItems = r.items.filter(i => !i.present);
-    const desc = missingItems.length > 0
-      ? `Отсутствует: ${missingItems.map(i => i.label.toLowerCase()).join('; ')}.`
-      : 'Политика содержит все обязательные пункты по ст. 18.1 152-ФЗ.';
+    const aiCount = r.items.filter(i => i.present && i.confirmedBy === 'ai').length;
+    let desc;
+    if (missingItems.length > 0) {
+      desc = `Отсутствует: ${escapeHtml(missingItems.map(i => i.label.toLowerCase()).join('; '))}.`;
+    } else if (aiCount > 0) {
+      desc = `Политика содержит все обязательные пункты по ст. 18.1 152-ФЗ (${aiCount} ${aiCount === 1 ? 'пункт подтверждён' : 'пунктов подтверждено'} AI после локального чек-листа).`;
+    } else {
+      desc = 'Политика содержит все обязательные пункты по ст. 18.1 152-ФЗ.';
+    }
 
     return `<div class="sz-egrul-block ${cls}">
       <div class="sz-egrul-title">${icon} ${title}</div>
