@@ -1298,6 +1298,16 @@
     unknown:  {label:'НЕТ ДАННЫХ',cls:'unknown'},
   };
 
+  // Заглушки для 5 AI-законов — рендерятся всегда, даже если Groq недоступен.
+  // Локальные переопределения (152-ФЗ от check152FZ, 149-ФЗ от ЕГРЮЛ) применяются поверх.
+  const AI_LAW_STUBS = [
+    { law: 'Упоминание наркотиков',             law_code: 'ст.6.13 КоАП, ФЗ №3',         fine: 'до 1 500 000 руб.',        status: 'unknown', issue: '', location: '', found_text: '', action: '' },
+    { law: '152-ФЗ — персональные данные',       law_code: '152-ФЗ, ст.13.11 КоАП',       fine: 'до 300 000 руб.',           status: 'unknown', issue: '', location: '', found_text: '', action: '' },
+    { law: 'Маркировка рекламы (ЕРИР)',          law_code: 'ФЗ №347, ст.14.3 КоАП',       fine: '100 000 — 500 000 руб.',    status: 'unknown', issue: '', location: '', found_text: '', action: '' },
+    { law: '149-ФЗ — информация о владельце',    law_code: '149-ФЗ ст.10, ст.13.31 КоАП', fine: 'до 100 000 руб.',           status: 'unknown', issue: '', location: '', found_text: '', action: '' },
+    { law: 'Публичная оферта и условия возврата',law_code: 'ГК РФ ст.435, ЗоЗПП ст.26.1', fine: 'до 500 000 руб.',           status: 'unknown', issue: '', location: '', found_text: '', action: '' },
+  ];
+
   function renderResults({ mode, origin, hostname, pages, aiData, source, egrul, stats }) {
     // Аггрегация по реестру
     const allItems = pages.flatMap(p => p.items);
@@ -1306,7 +1316,16 @@
     const inoUnmarked = inoItems.filter(i => !i.hasMarking);
     const extUnmarked = extItems.filter(i => !i.hasMarking);
 
-    const aiChecks = (aiData && aiData.checks) || [];
+    const aiWorked = aiData && aiData.checks && aiData.checks.length > 0;
+    const aiError  = aiData && aiData.error;
+    const aiChecks = aiWorked
+      ? aiData.checks
+      : AI_LAW_STUBS.map(s => ({
+          ...s,
+          // Для законов без локального переопределения — сообщаем, что нужен GROQ_KEY
+          issue:  s.law_code.includes('152-ФЗ') || s.law_code.includes('149-ФЗ') ? '' : 'Требуется AI-анализ — заполните GROQ_KEY в настройках скрипта',
+          action: s.law_code.includes('152-ФЗ') || s.law_code.includes('149-ФЗ') ? '' : 'Добавьте GROQ_KEY и повторите сканирование',
+        }));
     const totalSlezaUnmarked = inoUnmarked.length + extUnmarked.length;
     const totalAIViolations = aiChecks.filter(c => c.status === 'violation').length;
     const totalViolations = totalSlezaUnmarked + totalAIViolations;
@@ -1373,6 +1392,10 @@
       </div>
 
       <div class="sz-cl">// результаты по 7 законам</div>
+      ${aiError ? `<div style="background:rgba(245,158,11,.08);border:1px solid rgba(245,158,11,.3);border-radius:8px;padding:10px 14px;margin-bottom:10px;font-family:'Courier New',monospace;font-size:11px;color:#fbbf24;line-height:1.6">
+        ⚠ AI-анализ недоступен (${escapeHtml(String(aiError))})<br>
+        <span style="color:#94a3b8">152-ФЗ и 149-ФЗ проверены локально. Остальные законы требуют GROQ_KEY — заполните в настройках скрипта.</span>
+      </div>` : ''}
       <div class="sz-checks">
         ${renderSlezaCheck(inoItems, 'Маркировка иноагентов', 'ФЗ №121, №255-ФЗ', '40 000 — 500 000 руб.', pages, 'inoagent')}
         ${renderSlezaCheck(extItems, 'Маркировка экстремистов / террористов', 'ст.13.15 КоАП, ФЗ №114', 'до 500 000 руб.', pages, 'extremist')}
