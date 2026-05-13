@@ -1,0 +1,1479 @@
+// ==UserScript==
+// @name         Слеза // Compliance Scanner v7 (Full Site)
+// @namespace    https://sleza.media
+// @version      7.5.0
+// @description  Аудит сайта — контент в приоритете + ЕГРЮЛ + 152-ФЗ чек-лист
+// @author       Слеза
+// @match        *://*/*
+// @grant        GM_xmlhttpRequest
+// @grant        GM_addStyle
+// @connect      api.groq.com
+// @connect      sleza.media
+// @connect      egrul.org
+// @connect      *
+// @run-at       document-end
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  // ── API ключи ─────────────────────────────────
+  const GROQ_KEY  = 'YOUR_GROQ_API_KEY_HERE';
+  const SLEZA_KEY = 'YOUR_SLEZA_API_KEY_HERE';
+  // ──────────────────────────────────────────────
+
+  // ── Настройки краулера ────────────────────────
+  const MAX_PAGES        = 100;  // максимум страниц для скана (было 30)
+  const MAX_DEPTH        = 2;    // глубина обхода если нет sitemap
+  const BATCH_SIZE       = 10;   // страниц в одном API-запросе (батчинг)
+  const SLEZA_DELAY_MS   = 1100; // 1 запрос в секунду (лимит API)
+  const FETCH_TIMEOUT    = 8000; // таймаут загрузки страницы
+  // ──────────────────────────────────────────────
+
+  const MARK_PATTERNS = [
+    'иностранн','иноагент','экстремист','террорист',
+    'запрещ','признан','нежелательн',
+    'выполняющ функции','включ','имеющий статус'
+  ];
+
+  function categorizeMarking(m) {
+    const x = m.toLowerCase();
+    if (x.includes('иностранн') || x.includes('иноагент')) return 'inoagent';
+    if (x.includes('террорист')) return 'terrorist';
+    if (x.includes('экстремист') || x.includes('запрещ')) return 'extremist';
+    if (x.includes('нежелательн')) return 'undesirable';
+    return 'other';
+  }
+
+  function parseSlezaItem(item) {
+    const match = item.match(/^(.+?)\s*\((.+)\)\s*💧?\s*$/);
+    if (!match) return { name: item.trim(), marking: '', category: 'other' };
+    const name = match[1].trim();
+    const marking = match[2].trim().replace(/💧$/, '').trim();
+    return { name, marking, category: categorizeMarking(marking) };
+  }
+
+  function checkMarkingNearby(text, name) {
+    const lower = text.toLowerCase();
+    const idx = lower.indexOf(name.toLowerCase());
+    if (idx === -1) return { found: false };
+    const start = Math.max(0, idx - 100);
+    const end = Math.min(text.length, idx + name.length + 250);
+    const context = text.slice(start, end);
+    const cl = context.toLowerCase();
+    return {
+      found: true,
+      hasMarking: MARK_PATTERNS.some(p => cl.includes(p)),
+      context
+    };
+  }
+
+  // ── Запросы ───────────────────────────────────
+  let scanCancelled = false;
+
+  function checkWithSleza(text) {
+    return new Promise(resolve => {
+      if (scanCancelled) return resolve({ found: 0, items: [], errors: 'cancelled' });
+      GM_xmlhttpRequest({
+        method: 'POST',
+        url: 'https://sleza.media/api/parse',
+        timeout: 10000,
+        headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + SLEZA_KEY },
+        data: JSON.stringify({ text }),
+        onload(r) {
+          try {
+            resolve(JSON.parse(r.responseText));
+          } catch(e) { resolve({ found: 0, items: [], errors: 'parse' }); }
+        },
+        onerror() { resolve({ found: 0, items: [], errors: 'net' }); },
+        ontimeout() { resolve({ found: 0, items: [], errors: 'timeout' }); }
+      });
+    });
+  }
+
+  // ── Извлечение ИНН / ОГРН / ОГРНИП ────────────
+  function extractIdentifiers(text) {
+    const result = { inn: null, ogrn: null, type: null };
+    // ОГРН (13) или ОГРНИП (15) — приоритет, потому что точнее
+    const ogrnMatch = text.match(/ОГРН(?:ИП)?[\s:№.]*([0-9]{13}|[0-9]{15})/i);
+    if (ogrnMatch) {
+      result.ogrn = ogrnMatch[1];
+      result.type = ogrnMatch[1].length === 15 ? 'ip' : 'ul';
+    }
+    // ИНН (10 для ЮЛ, 12 для ИП)
+    const innMatch = text.match(/ИНН[\s:№.]*([0-9]{10}|[0-9]{12})/i);
+    if (innMatch) {
+      result.inn = innMatch[1];
+      if (!result.type) result.type = innMatch[1].length === 12 ? 'ip' : 'ul';
+    }
+    return result;
+  }
+
+  // ── Запрос в egrul.org ────────────────────────
+  function checkEgrul(identifier) {
+    return new Promise(resolve => {
+      if (!identifier || scanCancelled) return resolve(null);
+      GM_xmlhttpRequest({
+        method: 'GET',
+        url: `https://egrul.org/${identifier}.json`,
+        timeout: 8000,
+        onload(r) {
+          try {
+            if (r.status !== 200) return resolve({ found: false, error: `http_${r.status}` });
+            const data = JSON.parse(r.responseText);
+            resolve({ found: true, raw: data, parsed: parseEgrulData(data) });
+          } catch(e) { resolve({ found: false, error: 'parse' }); }
+        },
+        onerror() { resolve({ found: false, error: 'net' }); },
+        ontimeout() { resolve({ found: false, error: 'timeout' }); }
+      });
+    });
+  }
+
+  // ── Парсер ответа ФНС (защитный, пробует разные форматы) ──
+  function parseEgrulData(data) {
+    const r = { name:'', shortName:'', inn:'', ogrn:'', kpp:'', address:'', regDate:'', isActive:true, type:'unknown', reason:'' };
+    if (!data) return r;
+
+    // ЮЛ
+    const ul = data.СвЮЛ || (data.НаимЮЛПолн ? data : null);
+    if (ul) {
+      r.type = 'ul';
+      r.name = ul.НаимЮЛПолн || ul.СвНаимЮЛ?.НаимЮЛПолн || '';
+      r.shortName = ul.НаимЮЛСокр || ul.СвНаимЮЛ?.НаимЮЛСокр || '';
+      r.inn = ul.ИНН || '';
+      r.ogrn = ul.ОГРН || '';
+      r.kpp = ul.КПП || '';
+      r.regDate = ul.ДатаОГРН || ul.ДатаРег || '';
+      const addr = ul.СвАдресЮЛ || ul.АдресРФ;
+      if (addr) r.address = addr.АдресПолн || addr.АдресРФ?.АдресПолн || '';
+      if (ul.СвПрекрЮЛ || ul.СвСтатус?.КодСтатусЮЛ === '5' || ul.СвЛикв) {
+        r.isActive = false;
+        r.reason = ul.СвПрекрЮЛ?.НаимСпсПрекрЮЛ || 'Деятельность прекращена';
+      }
+      return r;
+    }
+    // ИП
+    const ip = data.СвИП || (data.ОГРНИП ? data : null);
+    if (ip) {
+      r.type = 'ip';
+      const f = ip.СвФЛ || ip;
+      r.name = `ИП ${f.Фамилия || f.ФамилияИП || ''} ${f.Имя || f.ИмяИП || ''} ${f.Отчество || f.ОтчествоИП || ''}`.trim();
+      r.inn = ip.ИННФЛ || ip.ИНН || '';
+      r.ogrn = ip.ОГРНИП || ip.ОГРН || '';
+      r.regDate = ip.ДатаОГРНИП || ip.ДатаРег || '';
+      if (ip.СвПрекрИП || ip.СвСтатус?.КодСтатусИП === '5') {
+        r.isActive = false;
+        r.reason = 'Деятельность прекращена';
+      }
+      return r;
+    }
+    return r;
+  }
+
+  // ── Локальный предфильтр: ищем потенциальные упоминания ─
+  // Возвращает true если на странице есть паттерны похожие на имена/организации
+  function hasNameLikePatterns(text) {
+    if (!text || text.length < 100) return false;
+
+    const patterns = [
+      // ФИО с отчеством: Иван Иванов Иванович
+      /[А-ЯЁ][а-яё]{2,}\s+[А-ЯЁ][а-яё]{2,}\s+[А-ЯЁ][а-яё]{2,}/,
+      // Имя Фамилия: Иван Иванов
+      /[А-ЯЁ][а-яё]{2,}\s+[А-ЯЁ][а-яё]{2,}/,
+      // Инициалы перед фамилией: И.И. Иванов или И. И. Иванов
+      /[А-ЯЁ]\.\s*[А-ЯЁ]\.\s*[А-ЯЁ][а-яё]{2,}/,
+      // Фамилия с инициалами: Иванов И.И.
+      /[А-ЯЁ][а-яё]{2,}\s+[А-ЯЁ]\.\s*[А-ЯЁ]\./,
+      // Название в кавычках: «...» или "..."
+      /[«"][А-ЯЁA-Z][^»"]{2,50}[»"]/,
+      // СМИ + название: «издание "X"», «журнал X», «газета X»
+      /(издани[еяю]|газет[ауы]|журнал[аеу]|телеканал|радио|агентств[оау]|медиа|редакци[яюей])/i,
+      // Организации: организация X, движение X, объединение X
+      /(организаци[яюей]|объединени[ея]|движени[ея]|фонд|сообществ[оау])\s+[«"]/i,
+      // Глаголы цитирования: сообщил X, заявил X, написал X, по данным X
+      /(сообщил[аи]?|написал[аи]?|заявил[аи]?|по\s+данным|по\s+мнению|рассказал[аи]?|подчеркнул[аи]?)\s+[А-ЯЁ]/i,
+      // Известные форматы маркировки (если уже промаркировано — тоже кандидат)
+      /\(иностранн[ыо]м?\s+агент/i,
+      /(признан[аы]?\s+иностранн[ыо]м?\s+агент|запрещ[её]н[ао]?\s+в\s+(?:РФ|России))/i
+    ];
+
+    return patterns.some(p => p.test(text));
+  }
+
+  // ── Чек-лист 152-ФЗ ст.18.1 — 7 обязательных пунктов политики ──
+  function check152FZ(policyText) {
+    if (!policyText || policyText.length < 100) {
+      return { found: 0, total: 7, items: [], status: 'no_policy' };
+    }
+    const t = policyText.toLowerCase();
+
+    const checks = [
+      {
+        id: 'categories',
+        label: 'Категории субъектов и персональных данных',
+        patterns: [/категори[яийю]\s+(перс|субъект)/, /перечень.{0,30}(перс|данн)/, /собира[еют]м.{0,30}(данн|сведени)/, /(ф\.?и\.?о\.?|фамилия|имя)\s*,?\s*(телефон|email|почт)/],
+        keywords: ['категории персональных', 'перечень персональных', 'обрабатываемые персональные']
+      },
+      {
+        id: 'purposes',
+        label: 'Цели обработки персональных данных',
+        patterns: [/цел[ьейяи]\s+обработк/, /(оператор|компани).{0,40}(в\s+целях|для\s+цел)/, /цел[ьею]\s+(обработ|сбор)/],
+        keywords: ['цели обработки', 'в целях', 'для целей', 'с целью']
+      },
+      {
+        id: 'legal_basis',
+        label: 'Правовое основание обработки',
+        patterns: [/правов(ое|ого|ом)\s+основани/, /(на\s+основании|в\s+соответствии).{0,80}152/, /(152.{0,3}ФЗ|федеральн.{0,15}закон.{0,15}152)/i, /(согласие|договор)\s+(является|служит|выступает)\s+основа/],
+        keywords: ['правовое основание', '152-ФЗ', 'согласие субъекта']
+      },
+      {
+        id: 'storage_term',
+        label: 'Срок обработки и хранения',
+        patterns: [/срок[аи]?\s+(хранен|обработ)/, /(хран[яеи]т|обрабатыва[еют]т)\s+(в\s+течени|до|на\s+протяжении)/, /(удал[яе]ются|уничтожаются)\s+(после|по\s+истечен|через)/, /срок.{0,30}(года?|месяц|дней?)/],
+        keywords: ['срок хранения', 'срок обработки', 'хранятся в течение', 'до достижения целей']
+      },
+      {
+        id: 'subject_rights',
+        label: 'Права субъекта персональных данных',
+        patterns: [/прав[аоеыхы]?\s+субъект/, /субъект\s+(имеет|вправе)\s+прав/, /прав[ао]\s+на\s+(доступ|удален|изменен|отзыв)/, /отзыв\s+согласи/],
+        keywords: ['права субъекта', 'право на доступ', 'право на удаление', 'отзыв согласия', 'право обратиться']
+      },
+      {
+        id: 'contact',
+        label: 'Контакты ответственного за обработку',
+        patterns: [/(ответствен[ныйогом]+\s+за\s+(обработ|защит))/, /(адрес|email|e-mail|телефон|тел\.).{0,80}(обраб|защит|оператор)/, /(оператор|компани).{0,100}(@|почт[аеуы]\s+электронн)/, /[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/i],
+        keywords: ['ответственный за обработку', 'обратиться к нам', 'связаться с нами по']
+      },
+      {
+        id: 'third_parties',
+        label: 'Передача данных третьим лицам',
+        patterns: [/треть[ьи]?м\s+лиц/, /(передач[аи]|переда[еют]м)\s+(данн|перс|сведени).{0,100}(треть|сторонн|партн)/, /трансгранич/, /(не\s+перед[ам]|без\s+согласи).{0,40}треть/],
+        keywords: ['третьим лицам', 'передача данных', 'трансграничная передача', 'третьи лица']
+      }
+    ];
+
+    const result = { items: [], found: 0, total: 7, status: 'unknown' };
+    for (const c of checks) {
+      const hasPattern = c.patterns.some(p => p.test(t));
+      const hasKeyword = c.keywords.some(k => t.includes(k.toLowerCase()));
+      const present = hasPattern || hasKeyword;
+      result.items.push({ id: c.id, label: c.label, present });
+      if (present) result.found++;
+    }
+
+    if (result.found >= 6) result.status = 'ok';
+    else if (result.found >= 3) result.status = 'risk';
+    else result.status = 'violation';
+
+    return result;
+  }
+
+  function fetchUrl(url) {
+    return new Promise(resolve => {
+      if (scanCancelled) return resolve({ url, ok: false, html: '', text: '' });
+      GM_xmlhttpRequest({
+        method: 'GET', url, timeout: FETCH_TIMEOUT,
+        onload(r) {
+          try {
+            const html = r.responseText || '';
+            const stripped = html
+              .replace(/<script[\s\S]*?<\/script>/gi, '')
+              .replace(/<style[\s\S]*?<\/style>/gi, '')
+              .replace(/<noscript[\s\S]*?<\/noscript>/gi, '')
+              .replace(/<[^>]+>/g, ' ')
+              .replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&')
+              .replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+              .replace(/&quot;/g, '"').replace(/&#39;/g, "'")
+              .replace(/\s+/g, ' ').trim();
+            const titleMatch = html.match(/<title[^>]*>([^<]+)<\/title>/i);
+            const title = titleMatch ? titleMatch[1].trim() : url;
+            resolve({ url, ok: true, html, text: stripped, title });
+          } catch(e) { resolve({ url, ok: false, html: '', text: '' }); }
+        },
+        onerror() { resolve({ url, ok: false, html: '', text: '' }); },
+        ontimeout() { resolve({ url, ok: false, html: '', text: '' }); }
+      });
+    });
+  }
+
+  // ── Sitemap ───────────────────────────────────
+  async function trySitemap(origin) {
+    const urls = [
+      origin + '/sitemap.xml',
+      origin + '/sitemap_index.xml',
+      origin + '/sitemap1.xml',
+    ];
+    for (const u of urls) {
+      const r = await fetchUrl(u);
+      if (r.ok && r.html.includes('<loc>')) {
+        const matches = [...r.html.matchAll(/<loc>([^<]+)<\/loc>/g)].map(m => m[1].trim());
+        const filtered = matches.filter(url => url.startsWith(origin) && isHtmlUrl(url));
+        if (filtered.length > 0) {
+          // Если это sitemap-индекс — рекурсивно загружаем дочерние
+          const subSitemaps = matches.filter(u => u.endsWith('.xml') && u !== origin);
+          if (subSitemaps.length > 0 && filtered.length < 5) {
+            const subUrls = [];
+            for (const sm of subSitemaps.slice(0, 3)) {
+              const sr = await fetchUrl(sm);
+              if (sr.ok) {
+                const sm2 = [...sr.html.matchAll(/<loc>([^<]+)<\/loc>/g)].map(m => m[1].trim());
+                subUrls.push(...sm2.filter(url => url.startsWith(origin) && isHtmlUrl(url)));
+              }
+            }
+            return { source: 'sitemap-index', urls: [...new Set([...filtered, ...subUrls])] };
+          }
+          return { source: 'sitemap', urls: [...new Set(filtered)] };
+        }
+      }
+    }
+    return null;
+  }
+
+  function isHtmlUrl(url) {
+    const lower = url.toLowerCase();
+    if (/\.(pdf|jpg|jpeg|png|gif|webp|svg|ico|zip|rar|exe|mp3|mp4|mov|css|js|json|xml|woff|woff2|ttf|eot)(\?|$)/.test(lower)) return false;
+    if (/(wp-admin|wp-content|wp-includes|admin|api\/|cdn\.|static\.|assets\.)/.test(lower)) return false;
+    return true;
+  }
+
+  // ── Приоритизация URL по вероятности контента ──
+  // Возвращает: 10 = контентная, 7 = главная, 5 = средняя, 3 = обычная, 1 = низкий приоритет, -1 = пропустить
+  function scoreUrl(url) {
+    let path = '';
+    let queryParamCount = 0;
+    try {
+      const u = new URL(url);
+      path = u.pathname.toLowerCase();
+      queryParamCount = [...u.searchParams.keys()].length;
+    } catch(e) { return 3; }
+    const full = (path + ' ' + url.toLowerCase());
+
+    // Пропускаем URL с большим количеством query-параметров (фильтры, рефералки, варианты)
+    if (queryParamCount >= 2) return -1;
+
+    // Пропускаем технические и каталожные страницы
+    const SKIP = [
+      // Корзина и заказы
+      /\/cart\b/, /\/basket\b/, /\/корзин/,
+      /\/checkout\b/, /\/оформ/, /\/order\//, /\/orders\b/, /\/заказ/,
+      /\/payment\b/, /\/оплат/, /\/pay\b/,
+      /\/shipping\b/, /\/доставк/, /\/delivery\b/,
+      // Авторизация
+      /\/login\b/, /\/register\b/, /\/signin\b/, /\/signup\b/, /\/войти/, /\/регистр/, /\/auth\b/,
+      /\/profile\b/, /\/account\b/, /\/cabinet\b/, /\/личн/,
+      // Поиск и фильтры
+      /\/search\b/, /\/поиск/,
+      /\/filter\b/, /\/фильтр/,
+      /\/tag\//, /\/метк/, /\/tags\//,
+      /\/category\//, /\/категори/, /\/categories\//,
+      // Продукты, каталог, магазин — НЕ нужны для проверки маркировки
+      /\/products?\b/, /\/товар/, /\/produkty/,
+      /\/catalog\b/, /\/каталог/,
+      /\/shop\b/, /\/магазин/, /\/store\b/,
+      /\/price\b/, /\/prices\b/, /\/цены/, /\/цена\b/, /\/стоимост/, /\/тариф/, /\/pricing\b/,
+      /\/sku\b/, /\/item\//,
+      // Технические
+      /\/feed\b/, /\/rss\b/,
+      /\/sitemap/, /\/карта-сайт/,
+      /\/404/, /\/error\b/,
+      /\/admin\b/, /\/wp-/, /\/api\b/,
+      /\/print\b/, /\/share\b/, /\/preview\b/,
+      // Пагинация
+      /\/page\/\d+$/, /[?&]page=\d+/, /[?&]p=\d+/
+    ];
+    if (SKIP.some(p => p.test(full))) return -1;
+
+    // ВЫСОКИЙ приоритет — контентные страницы (блог, новости, архивы, публикации)
+    const HIGH = [
+      // Базовое
+      /\/blog/, /\/news/, /\/press/, /\/article/, /\/post/, /\/story/, /\/stories/,
+      /\/блог/, /\/новост/, /\/стат(ь|и)/, /\/пресс/, /\/редакция/, /\/медиа/, /\/post/,
+      // Публикации и архивы
+      /\/publication/, /\/публикаци/, /\/опубликован/,
+      /\/archive/, /\/архив/,
+      /\/issues?\b/, /\/выпуск/, /\/issue\b/,
+      /\/digest/, /\/дайджест/,
+      /\/journal/, /\/журнал/, /\/magazine/,
+      /\/media\b/, /\/material/, /\/материал/,
+      // Контент и колонки
+      /\/content\b/, /\/контент/,
+      /\/column/, /\/колонк/,
+      /\/opinion/, /\/мнения?/, /\/мнение/, /\/editorial/, /\/редакторск/,
+      // Исследования и отчёты
+      /\/research/, /\/исследовани/,
+      /\/report\b/, /\/reports\b/, /\/отчёт/, /\/отчет/,
+      /\/analytic/, /\/аналитик/,
+      /\/trend/, /\/тренд/,
+      /\/case-?stud/, /\/кейс/,
+      // Экспертный контент
+      /\/insights?/, /\/инсайт/,
+      /\/expert/, /\/эксперт/,
+      /\/review/, /\/отзыв/, /\/обзор/,
+      // События и интервью
+      /\/events?\b/, /\/мероприят/,
+      /\/interview/, /\/интервью/,
+      /\/podcast/, /\/подкаст/,
+      // Авторы (часто содержат имена и цитаты)
+      /\/author/, /\/автор/, /\/писател/, /\/columnist/,
+      // Год/месяц в URL = архивная публикация
+      /\/(19|20)\d{2}\//, /\/(19|20)\d{2}-\d{2}/
+    ];
+    if (HIGH.some(p => p.test(full))) return 10;
+
+    // Главная страница
+    if (path === '/' || path === '') return 7;
+
+    // Средний приоритет — корпоративные страницы (нужны для AI: 152-ФЗ, 149-ФЗ, оферта)
+    const MED = [
+      /\/about/, /\/о-?(нас|компани)/, /\/about-us/,
+      /\/team/, /\/команд/, /\/коллектив/,
+      /\/career/, /\/работ/, /\/вакан/, /\/jobs/,
+      /\/contact/, /\/контакт/,
+      /\/portfolio/, /\/портфолио/,
+      /\/help/, /\/faq/, /\/помощ/,
+      /\/policy/, /\/политик/, /\/конфиденц/, /\/persondata/,
+      /\/offer/, /\/оферт/, /\/agreement/, /\/договор/, /\/правила/
+    ];
+    if (MED.some(p => p.test(full))) return 5;
+
+    // Всё остальное
+    return 3;
+  }
+
+  // ── Краулер (если нет sitemap) ────────────────
+  async function crawlSite(startUrl, maxPages, maxDepth, onProgress) {
+    const origin = new URL(startUrl).origin;
+    const visited = new Set();
+    const queue = [{ url: startUrl, depth: 0 }];
+    const results = [];
+
+    while (queue.length > 0 && results.length < maxPages && !scanCancelled) {
+      const { url, depth } = queue.shift();
+      if (visited.has(url)) continue;
+      visited.add(url);
+
+      onProgress({ phase: 'crawl', current: results.length, queued: queue.length, url });
+
+      const page = await fetchUrl(url);
+      if (!page.ok) continue;
+      results.push(url);
+
+      if (depth < maxDepth) {
+        const links = [...page.html.matchAll(/href=["']([^"']+)["']/gi)]
+          .map(m => m[1])
+          .map(href => {
+            try { return new URL(href, url).href.split('#')[0]; } catch(e) { return null; }
+          })
+          .filter(u => u && u.startsWith(origin) && !visited.has(u) && isHtmlUrl(u));
+
+        const unique = [...new Set(links)];
+        unique.slice(0, 20).forEach(u => {
+          if (!visited.has(u) && !queue.find(q => q.url === u)) {
+            queue.push({ url: u, depth: depth + 1 });
+          }
+        });
+      }
+    }
+    return { source: 'crawl', urls: results };
+  }
+
+  // ── DOM helpers ───────────────────────────────
+  function getCurrentPageContent() {
+    const url = location.href;
+    const title = document.title || '';
+    const links = Array.from(document.querySelectorAll('a[href]'))
+      .map(a => ({
+        text: (a.innerText||a.textContent||'').trim().slice(0,80),
+        href: a.href,
+        path: (() => { try { return new URL(a.href).pathname.toLowerCase(); } catch(e) { return ''; } })()
+      }))
+      .filter(l => l.text && l.href.startsWith(location.origin));
+    const seen = new Set();
+    const uniqueLinks = links.filter(l => seen.has(l.href) ? false : (seen.add(l.href), true));
+
+    const KW = {
+      policy: ['политик','конфиденц','персональн','privacy','cookie','данных'],
+      offer:  ['оферт','договор','правила','усло','public-offer'],
+      ret:    ['возврат','обмен','отказ'],
+      about:  ['о компани','о нас','контакт','about','contact','реквизит']
+    };
+    const m = (l, kws) => { const t = (l.text+' '+l.path).toLowerCase(); return kws.some(k => t.includes(k)); };
+
+    const headerEl = document.querySelector('header,#header,.header');
+    const footerEl = document.querySelector('footer,#footer,.footer');
+
+    return {
+      url, title,
+      header: headerEl ? headerEl.innerText.slice(0, 500) : '',
+      footer: footerEl ? footerEl.innerText.slice(0, 800) : '',
+      bodyText: document.body.innerText.slice(0, 8000),
+      links: uniqueLinks.slice(0, 40),
+      policyLinks: uniqueLinks.filter(l => m(l, KW.policy)).slice(0, 2),
+      offerLinks:  uniqueLinks.filter(l => m(l, KW.offer)).slice(0, 2),
+      returnLinks: uniqueLinks.filter(l => m(l, KW.ret)).slice(0, 2),
+      aboutLinks:  uniqueLinks.filter(l => m(l, KW.about)).slice(0, 2),
+      hasAdScripts: document.querySelectorAll('script[src*="googletagmanager"],script[src*="yandex"],script[src*="vk.com/js"]').length > 0,
+      hasCookieBanner: !!document.querySelector('[class*="cookie"i],[id*="cookie"i],[class*="consent"i],[id*="consent"i]')
+    };
+  }
+
+  function findElementByText(searchText) {
+    if (!searchText || searchText.length < 5) return null;
+    const clean = searchText.replace(/^["«]|["»]$/g, '').trim();
+    if (clean.length < 5) return null;
+    const w = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, {
+      acceptNode(n) {
+        if (!n.textContent || n.textContent.length < 3) return NodeFilter.FILTER_REJECT;
+        const p = n.parentElement;
+        if (!p || ['SCRIPT','STYLE','NOSCRIPT'].includes(p.tagName)) return NodeFilter.FILTER_REJECT;
+        return NodeFilter.FILTER_ACCEPT;
+      }
+    });
+    let node;
+    while ((node = w.nextNode())) {
+      if (node.textContent.includes(clean)) return node.parentElement;
+    }
+    const short = clean.slice(0, 25);
+    const w2 = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+    while ((node = w2.nextNode())) {
+      if (node.textContent.includes(short)) {
+        const p = node.parentElement;
+        if (p && !['SCRIPT','STYLE'].includes(p.tagName)) return p;
+      }
+    }
+    return null;
+  }
+
+  let activeHighlight = null;
+  function highlightElement(el) {
+    if (!el) return false;
+    if (activeHighlight) {
+      activeHighlight.style.outline = ''; activeHighlight.style.outlineOffset = '';
+      activeHighlight.style.backgroundColor = '';
+    }
+    activeHighlight = el;
+    el.style.transition = 'outline-color 0.4s, background-color 0.4s';
+    el.style.outline = '3px solid #ef4444'; el.style.outlineOffset = '4px';
+    el.style.backgroundColor = 'rgba(239,68,68,0.12)';
+    el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    let c = 0;
+    const p = setInterval(() => {
+      if (c >= 6) { clearInterval(p); return; }
+      el.style.outline = c % 2 === 0 ? '3px solid #f87171' : '5px solid #ef4444';
+      c++;
+    }, 350);
+    return true;
+  }
+
+  function setModalDimmed(d) {
+    const ov = document.getElementById('sz-ov');
+    if (!ov) return;
+    if (d) ov.classList.add('sz-dimmed');
+    else ov.classList.remove('sz-dimmed');
+  }
+
+  // ── AI промпт (для остальных законов) ────────
+  const SYSTEM = `Ты эксперт по российскому digital compliance.
+Маркировка иноагентов/экстремистов проверена через API Слезы — НЕ оценивай её, оценивай только остальные законы.
+
+Правила:
+- ok: требование выполнено
+- risk: возможное нарушение
+- violation: явное нарушение
+- unknown: нет данных
+
+Если контент политики/оферты есть — это НЕ нарушение.
+Не уверен — ставь "ok" или "unknown", НЕ "violation".
+
+Верни ТОЛЬКО JSON:
+{
+  "site_name":"...","site_type":"...","summary":"2-3 предложения",
+  "checks":[
+    {"law":"Упоминание наркотиков","law_code":"ст.6.13 КоАП, ФЗ №3","status":"violation|risk|ok|unknown","issue":"...","location":"...","found_text":"...","found_url":"","fine":"до 1 500 000 руб.","action":"..."},
+    {"law":"152-ФЗ — персональные данные","law_code":"152-ФЗ, ст.13.11 КоАП","status":"...","issue":"...","location":"...","found_text":"...","found_url":"","fine":"до 300 000 руб.","action":"..."},
+    {"law":"Маркировка рекламы (ЕРИР)","law_code":"ФЗ №347, ст.14.3 КоАП","status":"...","issue":"...","location":"...","found_text":"...","found_url":"","fine":"100 000 — 500 000 руб.","action":"..."},
+    {"law":"149-ФЗ — информация о владельце","law_code":"149-ФЗ ст.10, ст.13.31 КоАП","status":"...","issue":"...","location":"...","found_text":"...","found_url":"","fine":"до 100 000 руб.","action":"..."},
+    {"law":"Публичная оферта и условия возврата","law_code":"ГК РФ ст.435, ЗоЗПП ст.26.1","status":"...","issue":"...","location":"...","found_text":"...","found_url":"","fine":"до 500 000 руб.","action":"..."}
+  ]
+}`;
+
+  GM_addStyle(`
+    #sz-btn{position:fixed;bottom:28px;right:28px;z-index:2147483647;background:#1a5fb4;color:#fff;border:none;border-radius:50px;padding:12px 20px;font-family:'Courier New',monospace;font-size:13px;font-weight:700;letter-spacing:.06em;cursor:pointer;box-shadow:0 4px 24px rgba(26,95,180,.5);display:flex;align-items:center;gap:8px;transition:transform .2s,box-shadow .2s;user-select:none}
+    #sz-btn:hover{transform:translateY(-2px);box-shadow:0 8px 32px rgba(26,95,180,.6)}
+    .sz-dot{width:7px;height:7px;background:#60a5fa;border-radius:50%;animation:sz-p 2s infinite}
+    @keyframes sz-p{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.3;transform:scale(1.6)}}
+    @keyframes sz-s{to{transform:rotate(360deg)}}
+    #sz-ov{position:fixed;inset:0;z-index:2147483646;background:rgba(0,0,0,.78);backdrop-filter:blur(5px);display:flex;align-items:center;justify-content:center;padding:20px;transition:opacity .3s,background .3s}
+    #sz-ov.sz-dimmed{background:rgba(0,0,0,.15);backdrop-filter:none;pointer-events:none}
+    #sz-ov.sz-dimmed #sz-modal{opacity:.25;transform:scale(.95);pointer-events:none}
+    #sz-ov.sz-dimmed .sz-restore{display:flex !important;pointer-events:auto}
+    #sz-modal{background:#0b0f1a;border:1px solid #1e2d45;border-radius:16px;width:100%;max-width:840px;max-height:92vh;overflow-y:auto;font-family:system-ui,sans-serif;color:#e2e8f0;scrollbar-width:thin;scrollbar-color:#1e2d45 transparent;transition:opacity .3s,transform .3s}
+    #sz-modal::-webkit-scrollbar{width:5px}#sz-modal::-webkit-scrollbar-thumb{background:#1e2d45;border-radius:3px}
+    .sz-restore{display:none;position:fixed;bottom:28px;left:50%;transform:translateX(-50%);z-index:2147483647;background:#1a5fb4;color:#fff;border:none;border-radius:50px;padding:10px 18px;font-family:'Courier New',monospace;font-size:12px;font-weight:700;letter-spacing:.06em;cursor:pointer;box-shadow:0 4px 24px rgba(26,95,180,.6);align-items:center;gap:8px}
+    .sz-hdr{background:#111827;border-bottom:1px solid #1e2d45;padding:13px 20px;display:flex;align-items:center;gap:12px;border-radius:16px 16px 0 0;position:sticky;top:0;z-index:1}
+    .sz-brand{font-family:'Courier New',monospace;font-size:12px;font-weight:700;letter-spacing:.1em;color:#fff}
+    .sz-hsub{font-family:'Courier New',monospace;font-size:9px;color:#64748b;margin-top:1px}
+    .sz-vbadge{font-family:'Courier New',monospace;font-size:9px;padding:2px 7px;border-radius:10px;background:linear-gradient(90deg,#1a5fb4,#3b82f6);color:#fff;border:1px solid rgba(59,130,246,.4);margin-left:4px}
+    .sz-close{margin-left:auto;background:#1a2235;border:1px solid #2d3f5a;border-radius:6px;padding:5px 11px;font-family:'Courier New',monospace;font-size:11px;color:#94a3b8;cursor:pointer}
+    .sz-close:hover{color:#ef4444;border-color:rgba(239,68,68,.4)}
+    .sz-body{padding:18px}
+
+    /* Выбор режима */
+    .sz-mode{padding:12px;display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:14px}
+    .sz-mode-btn{background:#111827;border:1px solid #1e2d45;border-radius:10px;padding:14px 16px;cursor:pointer;text-align:left;transition:all .15s}
+    .sz-mode-btn:hover{border-color:#3b82f6;background:#1a2235}
+    .sz-mode-btn.full{border-color:#3b82f6;background:linear-gradient(135deg,#1a2235,#1e3a5f)}
+    .sz-mode-title{font-size:14px;font-weight:600;color:#fff;margin-bottom:4px}
+    .sz-mode-desc{font-size:11px;color:#94a3b8;line-height:1.5}
+    .sz-mode-time{font-family:'Courier New',monospace;font-size:9px;color:#60a5fa;margin-top:6px}
+
+    /* Прогресс */
+    .sz-progress{padding:24px 20px;text-align:center}
+    .sz-spinner{width:32px;height:32px;border:3px solid #1e2d45;border-top-color:#3b82f6;border-radius:50%;animation:sz-s .8s linear infinite;margin:0 auto 14px}
+    .sz-prog-title{font-size:13px;font-weight:600;color:#fff;margin-bottom:6px}
+    .sz-prog-stage{font-family:'Courier New',monospace;font-size:11px;color:#60a5fa;margin-bottom:14px}
+    .sz-prog-bar{background:#0f1923;border-radius:6px;height:10px;overflow:hidden;border:1px solid #1e2d45;margin:0 auto 10px;max-width:480px}
+    .sz-prog-fill{background:linear-gradient(90deg,#3b82f6,#60a5fa);height:100%;transition:width .3s;border-radius:6px}
+    .sz-prog-stats{font-family:'Courier New',monospace;font-size:10px;color:#94a3b8;display:flex;justify-content:center;gap:18px;margin-bottom:14px}
+    .sz-prog-stats span{color:#fff;font-weight:700}
+    .sz-prog-current{font-family:'Courier New',monospace;font-size:9px;color:#475569;word-break:break-all;text-align:center;max-width:600px;margin:0 auto;line-height:1.5}
+    .sz-cancel-btn{background:#1a2235;border:1px solid rgba(239,68,68,.3);border-radius:6px;padding:7px 16px;font-family:inherit;font-size:11px;color:#f87171;cursor:pointer;margin-top:14px}
+    .sz-cancel-btn:hover{border-color:rgba(239,68,68,.5);background:rgba(239,68,68,.08)}
+
+    .sz-found-live{display:flex;justify-content:center;gap:14px;margin-top:14px;font-family:'Courier New',monospace;font-size:10px}
+    .sz-found-live .lbl{color:#64748b}
+    .sz-found-live .num{color:#f87171;font-weight:700;font-size:13px}
+    .sz-found-live .num.zero{color:#4ade80}
+
+    /* Результаты */
+    .sz-sum{border-radius:10px;padding:16px;margin-bottom:12px;display:grid;grid-template-columns:1fr auto;gap:12px;align-items:center}
+    .sz-sum.high{background:rgba(239,68,68,.08);border:1px solid rgba(239,68,68,.2)}
+    .sz-sum.medium{background:rgba(245,158,11,.08);border:1px solid rgba(245,158,11,.2)}
+    .sz-sum.low{background:rgba(34,197,94,.08);border:1px solid rgba(34,197,94,.2)}
+    .sz-sl{font-family:'Courier New',monospace;font-size:10px;color:#64748b;margin-bottom:4px}
+    .sz-sl span{color:#60a5fa}
+    .sz-rt{font-size:17px;font-weight:700;margin-bottom:3px}
+    .sz-rd{font-size:12px;color:#94a3b8;line-height:1.5}
+    .sz-sc{font-family:'Courier New',monospace;font-size:42px;font-weight:700;line-height:1;text-align:right}
+    .sz-scl{font-family:'Courier New',monospace;font-size:9px;color:#64748b;text-align:right;margin-top:1px;letter-spacing:.06em}
+    .c-high{color:#f87171}.c-medium{color:#fbbf24}.c-low{color:#4ade80}
+
+    .sz-stats-row{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:12px}
+    .sz-stat{background:#111827;border:1px solid #1e2d45;border-radius:8px;padding:10px 12px;text-align:center}
+    .sz-stat-num{font-family:'Courier New',monospace;font-size:18px;font-weight:700;color:#fff;line-height:1}
+    .sz-stat-num.bad{color:#f87171}
+    .sz-stat-num.warn{color:#fbbf24}
+    .sz-stat-num.ok{color:#4ade80}
+    .sz-stat-lbl{font-family:'Courier New',monospace;font-size:9px;color:#64748b;margin-top:5px;letter-spacing:.04em;text-transform:uppercase}
+
+    .sz-cl{font-family:'Courier New',monospace;font-size:10px;letter-spacing:.1em;color:#64748b;text-transform:uppercase;margin-bottom:8px}
+    .sz-checks{display:flex;flex-direction:column;gap:7px;margin-bottom:14px}
+    .sz-check{background:#111827;border-radius:8px;padding:12px 14px}
+    .sz-check.violation{border-left:3px solid #ef4444}
+    .sz-check.risk{border-left:3px solid #f59e0b}
+    .sz-check.ok{border-left:3px solid #22c55e}
+    .sz-check.unknown{border-left:3px solid #334155}
+    .sz-ct{display:flex;align-items:flex-start;justify-content:space-between;gap:10px;margin-bottom:8px}
+    .sz-ln{font-size:12px;font-weight:600;color:#fff;margin-bottom:2px}
+    .sz-lc{font-family:'Courier New',monospace;font-size:9px;color:#64748b}
+    .sz-pill{font-family:'Courier New',monospace;font-size:9px;font-weight:700;padding:2px 8px;border-radius:3px;letter-spacing:.05em;white-space:nowrap;flex-shrink:0}
+    .sz-pill.violation{background:rgba(239,68,68,.12);color:#f87171;border:1px solid rgba(239,68,68,.3)}
+    .sz-pill.risk{background:rgba(245,158,11,.12);color:#fbbf24;border:1px solid rgba(245,158,11,.3)}
+    .sz-pill.ok{background:rgba(34,197,94,.12);color:#4ade80;border:1px solid rgba(34,197,94,.3)}
+    .sz-pill.unknown{background:rgba(100,116,139,.1);color:#94a3b8;border:1px solid rgba(100,116,139,.25)}
+    .sz-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+    .sz-full{grid-column:span 2}
+    .sz-fl{font-family:'Courier New',monospace;font-size:8px;letter-spacing:.08em;color:#475569;text-transform:uppercase;margin-bottom:2px}
+    .sz-fv{font-size:11px;color:#94a3b8;line-height:1.5}
+    .sz-fv.iss{font-size:12px}
+    .sz-check.violation .sz-fv.iss{color:#f87171}
+    .sz-check.ok .sz-fv.iss{color:#4ade80}
+
+    /* Список нарушений по страницам */
+    .sz-pages-list{margin-top:8px;display:flex;flex-direction:column;gap:6px;max-height:340px;overflow-y:auto;background:#0f1923;border-radius:6px;padding:8px}
+    .sz-page-item{background:#111827;border:1px solid #1e2d45;border-radius:6px;padding:8px 10px}
+    .sz-page-item.bad{border-left:2px solid #ef4444}
+    .sz-page-url{font-family:'Courier New',monospace;font-size:10px;color:#60a5fa;word-break:break-all;display:block;margin-bottom:4px;text-decoration:none}
+    .sz-page-url:hover{color:#93c5fd;text-decoration:underline}
+    .sz-page-violations{display:flex;flex-direction:column;gap:3px;margin-top:4px}
+    .sz-page-violation{font-family:'Courier New',monospace;font-size:9px;display:flex;justify-content:space-between;gap:6px;padding:3px 6px;background:rgba(239,68,68,.06);border-radius:3px}
+    .sz-page-violation .name{color:#f87171;font-weight:700}
+    .sz-page-violation .mark{color:#94a3b8;font-style:italic;flex:1;text-align:right;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+    .sz-loc-btn{display:inline-flex;align-items:center;gap:6px;background:#1a2235;border:1px solid #2d3f5a;border-radius:5px;padding:5px 10px;font-family:'Courier New',monospace;font-size:10px;color:#60a5fa;margin-top:6px;cursor:pointer;text-decoration:none;transition:all .15s;max-width:100%;text-align:left}
+    .sz-loc-btn:hover{background:#243044;border-color:#3b82f6;color:#93c5fd;transform:translateX(2px)}
+    .sz-loc-btn.absent{cursor:default;color:#94a3b8;border-color:rgba(245,158,11,.3);background:rgba(245,158,11,.08)}
+    .sz-loc-btn.absent:hover{transform:none;background:rgba(245,158,11,.08)}
+    .sz-loc-icon{font-size:11px;flex-shrink:0}
+    .sz-loc-label{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+    .sz-quote{background:#0f1923;border-left:2px solid #2d3f5a;border-radius:0 4px 4px 0;padding:6px 10px;font-family:'Courier New',monospace;font-size:10px;color:#64748b;margin-top:5px;line-height:1.5;font-style:italic;word-break:break-word}
+
+    .sz-cta{background:linear-gradient(135deg,#111827,#1a2235);border:1px solid #1e2d45;border-radius:10px;padding:14px 16px;display:flex;align-items:center;justify-content:space-between;margin-bottom:10px}
+    .sz-ctat{font-size:13px;font-weight:600;color:#fff;margin-bottom:2px}
+    .sz-ctas{font-size:11px;color:#64748b}
+    .sz-ctal{font-family:'Courier New',monospace;font-size:11px;color:#3b82f6;font-weight:700;white-space:nowrap;margin-left:16px}
+    .sz-disc{font-family:'Courier New',monospace;font-size:9px;color:#374151;line-height:1.8;background:#111827;border-radius:6px;padding:10px 12px}
+    .sz-err{background:rgba(239,68,68,.08);border:1px solid rgba(239,68,68,.25);border-radius:8px;padding:16px;text-align:center;color:#f87171;font-size:13px;line-height:1.8}
+    .sz-acts{display:flex;gap:8px;margin-bottom:12px}
+    .sz-abtn{background:#1a2235;border:1px solid #2d3f5a;border-radius:6px;padding:7px 13px;font-size:11px;color:#94a3b8;cursor:pointer;font-family:inherit}
+    .sz-abtn:hover{color:#e2e8f0;border-color:#3b82f6}
+
+    /* Блок ЕГРЮЛ */
+    .sz-egrul-block{margin-top:8px;border-radius:8px;padding:10px 12px;border:1px solid;background:#0f1923}
+    .sz-egrul-block.good{border-color:rgba(34,197,94,.3);background:linear-gradient(135deg,rgba(34,197,94,.04),rgba(34,197,94,.08))}
+    .sz-egrul-block.bad{border-color:rgba(239,68,68,.3);background:linear-gradient(135deg,rgba(239,68,68,.04),rgba(239,68,68,.08))}
+    .sz-egrul-block.warn{border-color:rgba(245,158,11,.3);background:linear-gradient(135deg,rgba(245,158,11,.04),rgba(245,158,11,.08))}
+    .sz-egrul-title{font-family:'Courier New',monospace;font-size:11px;font-weight:700;margin-bottom:6px;letter-spacing:.04em}
+    .sz-egrul-block.good .sz-egrul-title{color:#4ade80}
+    .sz-egrul-block.bad .sz-egrul-title{color:#f87171}
+    .sz-egrul-block.warn .sz-egrul-title{color:#fbbf24}
+    .sz-egrul-row{font-family:'Courier New',monospace;font-size:10px;color:#94a3b8;padding:2px 0;display:grid;grid-template-columns:90px 1fr;gap:6px}
+    .sz-egrul-row span{color:#64748b}
+    .sz-egrul-row strong.ok{color:#4ade80}
+    .sz-egrul-row strong.bad{color:#f87171}
+    .sz-egrul-desc{font-size:11px;color:#94a3b8;margin-top:6px;line-height:1.5;font-style:italic}
+
+    /* Чек-лист 152-ФЗ */
+    .sz-152-list{display:flex;flex-direction:column;gap:3px;margin-top:6px;background:rgba(0,0,0,.25);border-radius:5px;padding:8px 10px}
+    .sz-152-row{display:grid;grid-template-columns:18px 1fr;gap:8px;align-items:center;font-family:'Courier New',monospace;font-size:11px;padding:2px 0}
+    .sz-152-icon{font-weight:700;font-size:12px;text-align:center}
+    .sz-152-icon.ok{color:#4ade80}
+    .sz-152-icon.miss{color:#f87171}
+    .sz-152-label{color:#94a3b8}
+    .sz-152-label.miss{color:#f87171;text-decoration:line-through;text-decoration-color:rgba(239,68,68,.4)}
+  `);
+
+  const btn = document.createElement('button');
+  btn.id = 'sz-btn';
+  btn.innerHTML = '<span class="sz-dot"></span>СЛЕЗА // ПРОВЕРИТЬ';
+  document.body.appendChild(btn);
+  btn.onclick = openModal;
+
+  let ov = null;
+
+  function openModal() {
+    if (ov) return;
+    scanCancelled = false;
+
+    ov = document.createElement('div');
+    ov.id = 'sz-ov';
+    ov.innerHTML = `
+      <div id="sz-modal">
+        <div class="sz-hdr">
+          <div class="sz-dot"></div>
+          <div>
+            <div class="sz-brand">СЛЕЗА // COMPLIANCE SCANNER<span class="sz-vbadge">v7.0 FULL SITE</span></div>
+            <div class="sz-hsub">ВЫБЕРИТЕ РЕЖИМ ПРОВЕРКИ</div>
+          </div>
+          <button class="sz-close" id="sz-x">✕ закрыть</button>
+        </div>
+        <div class="sz-body" id="sz-bd"></div>
+      </div>
+      <button class="sz-restore" id="sz-restore">⬆ Вернуться к отчёту</button>`;
+
+    document.body.appendChild(ov);
+    document.getElementById('sz-x').onclick = closeModal;
+    document.getElementById('sz-restore').onclick = () => setModalDimmed(false);
+    showModeChooser();
+  }
+
+  function closeModal() {
+    scanCancelled = true;
+    if (ov) { ov.remove(); ov = null; }
+    if (activeHighlight) {
+      activeHighlight.style.outline = ''; activeHighlight.style.outlineOffset = '';
+      activeHighlight.style.backgroundColor = ''; activeHighlight = null;
+    }
+  }
+
+  function showModeChooser() {
+    const bd = document.getElementById('sz-bd');
+    bd.innerHTML = `
+      <div style="padding:8px 0 4px;text-align:center;color:#94a3b8;font-size:13px;line-height:1.6">
+        <div style="font-family:'Courier New',monospace;font-size:10px;color:#3b82f6;letter-spacing:.1em;text-transform:uppercase;margin-bottom:6px">Что проверяем</div>
+        <div>${location.hostname}</div>
+      </div>
+      <div class="sz-mode">
+        <div class="sz-mode-btn" id="mode-current">
+          <div class="sz-mode-title">Текущая страница</div>
+          <div class="sz-mode-desc">Быстрая проверка только этой страницы. Хорошо для демо за 10 секунд.</div>
+          <div class="sz-mode-time">~ 10 сек</div>
+        </div>
+        <div class="sz-mode-btn full" id="mode-full">
+          <div class="sz-mode-title">Весь сайт</div>
+          <div class="sz-mode-desc">Полный аудит — sitemap.xml или обход до ${MAX_PAGES} страниц. Точно покажет все нарушения.</div>
+          <div class="sz-mode-time">~ 40-60 сек</div>
+        </div>
+      </div>`;
+    document.getElementById('mode-current').onclick = () => runSinglePageScan();
+    document.getElementById('mode-full').onclick = () => runFullSiteScan();
+  }
+
+  function showProgress({ phase, current, total, queued, url, found, skipped }) {
+    const bd = document.getElementById('sz-bd');
+    if (!bd) return;
+    const pct = total > 0 ? Math.round((current / total) * 100) : 0;
+    const phaseText = {
+      'sitemap': 'Поиск sitemap.xml',
+      'crawl': 'Обход сайта',
+      'sleza': 'Проверка по реестру Слезы',
+      'ai': 'AI-анализ остальных законов',
+    }[phase] || phase;
+
+    bd.innerHTML = `
+      <div class="sz-progress">
+        <div class="sz-spinner"></div>
+        <div class="sz-prog-title">${phaseText}</div>
+        <div class="sz-prog-stage">${url ? '→ ' + url.slice(0, 80) : ''}</div>
+        ${total > 0 ? `<div class="sz-prog-bar"><div class="sz-prog-fill" style="width:${pct}%"></div></div>` : ''}
+        <div class="sz-prog-stats">
+          ${total > 0 ? `<span>${current}</span> из <span>${total}</span> страниц` : ''}
+          ${queued !== undefined ? `· в очереди: <span>${queued}</span>` : ''}
+          ${skipped !== undefined && skipped > 0 ? `· <span style="color:#4ade80">⚡ пропущено фильтром: <strong>${skipped}</strong></span>` : ''}
+        </div>
+        ${found ? `<div class="sz-found-live">
+          <div><span class="lbl">найдено упоминаний:</span> <span class="num ${found.total === 0 ? 'zero' : ''}">${found.total}</span></div>
+          <div><span class="lbl">без маркировки:</span> <span class="num ${found.unmarked === 0 ? 'zero' : ''}">${found.unmarked}</span></div>
+        </div>` : ''}
+        <button class="sz-cancel-btn" onclick="window.szCancel && window.szCancel()">✕ Отменить</button>
+      </div>`;
+    window.szCancel = () => { scanCancelled = true; };
+  }
+
+  // ── Сценарий: одна страница ───────────────────
+  async function runSinglePageScan() {
+    showProgress({ phase: 'sleza', current: 0, total: 1, url: location.href });
+    const c = getCurrentPageContent();
+    const fullText = `${c.title}\n${c.header}\n${c.bodyText}\n${c.footer}`;
+
+    const slezaResult = await checkWithSleza(fullText);
+    const items = (slezaResult.items || []).map(parseSlezaItem);
+    const checked = items.map(item => ({ ...item, ...checkMarkingNearby(fullText, item.name), pageUrl: location.href }));
+
+    // ЕГРЮЛ-проверка реквизитов
+    showProgress({ phase: 'sleza', current: 1, total: 1, url: 'Проверка ЕГРЮЛ...' });
+    const ids = extractIdentifiers(fullText);
+    let egrulResult = null;
+    if (ids.ogrn || ids.inn) {
+      egrulResult = await checkEgrul(ids.ogrn || ids.inn);
+    }
+    const egrul = { checked: true, ids, result: egrulResult };
+
+    showProgress({ phase: 'ai', current: 1, total: 1 });
+    const aiData = await runAIAnalysis(c, egrul);
+
+    renderResults({
+      mode: 'single',
+      origin: location.origin,
+      hostname: location.hostname,
+      pages: [{ url: location.href, title: c.title, items: checked, isCurrent: true }],
+      aiData,
+      egrul
+    });
+  }
+
+  // ── Сценарий: весь сайт ──────────────────────
+  async function runFullSiteScan() {
+    const origin = location.origin;
+    const hostname = location.hostname;
+
+    // 1. Получаем список URL
+    showProgress({ phase: 'sitemap', current: 0, total: 0, url: origin });
+    let urlList = await trySitemap(origin);
+    if (scanCancelled) return;
+
+    if (!urlList || urlList.urls.length === 0) {
+      showProgress({ phase: 'crawl', current: 0, total: MAX_PAGES, url: origin });
+      urlList = await crawlSite(location.href, MAX_PAGES, MAX_DEPTH, p => {
+        if (!scanCancelled) showProgress({ phase: 'crawl', current: p.current, total: MAX_PAGES, queued: p.queued, url: p.url });
+      });
+    }
+    if (scanCancelled) return;
+
+    let urls = urlList.urls;
+
+    // ── Стратегия отбора: контент важнее всего ──
+    // 1. Берём все HIGH (контентные) страницы
+    // 2. Главная + 2-3 MED страницы (для AI анализа политики/оферты)
+    // 3. LOW страницы — только если осталось место
+    const scored = urls
+      .map(u => ({ url: u, score: scoreUrl(u) }))
+      .filter(x => x.score >= 0); // отбрасываем технические страницы
+
+    const highPages = scored.filter(x => x.score >= 10).map(x => x.url);
+    const medPages  = scored.filter(x => x.score === 5 || x.score === 7).map(x => x.url);
+    const lowPages  = scored.filter(x => x.score === 3).map(x => x.url);
+
+    // Сначала HIGH (контент)
+    let prioritized = [...highPages];
+    // Добавляем MED для AI-анализа (но не больше 5 на корпоративные)
+    const medSlots = Math.min(medPages.length, Math.min(5, MAX_PAGES - prioritized.length));
+    prioritized = [...prioritized, ...medPages.slice(0, medSlots)];
+    // LOW — только если есть свободные слоты
+    if (prioritized.length < MAX_PAGES) {
+      prioritized = [...prioritized, ...lowPages.slice(0, MAX_PAGES - prioritized.length)];
+    }
+
+    // Главная всегда первая
+    const withoutCurrent = prioritized.filter(u => u !== location.href);
+    urls = [location.href, ...withoutCurrent].slice(0, MAX_PAGES);
+
+    // Статистика по типам
+    const stats = {
+      high: highPages.length,
+      highScanned: Math.min(highPages.length, MAX_PAGES),
+      mid: medSlots,
+      low: Math.max(0, urls.length - highPages.length - medSlots - 1),
+      skipped: urlList.urls.length - scored.length,
+      totalHighFound: highPages.length
+    };
+
+    // 2. Сканируем каждую страницу через API Слезы
+    const pages = [];
+    let totalUnmarked = 0;
+    let totalFound = 0;
+    let skippedByFilter = 0; // счётчик пропущенных предфильтром
+
+    for (let i = 0; i < urls.length; i++) {
+      if (scanCancelled) break;
+      const url = urls[i];
+      const score = scoreUrl(url);
+      const typeLabel = score >= 10 ? '📰 контент' : score >= 7 ? '🏠 главная' : score >= 5 ? '🏢 корпоративн.' : '📄 страница';
+
+      showProgress({
+        phase: 'sleza', current: i, total: urls.length,
+        url: `${typeLabel} · ${url.replace(location.origin, '')}`,
+        found: { total: totalFound, unmarked: totalUnmarked },
+        skipped: skippedByFilter
+      });
+
+      let pageData;
+      if (url === location.href) {
+        // Текущая страница — берём из DOM (быстрее и точнее)
+        const c = getCurrentPageContent();
+        pageData = {
+          url, ok: true,
+          text: `${c.title}\n${c.header}\n${c.bodyText}\n${c.footer}`,
+          title: c.title
+        };
+      } else {
+        pageData = await fetchUrl(url);
+      }
+
+      if (!pageData.ok || !pageData.text) {
+        pages.push({ url, title: pageData.title || url, items: [], error: 'не загружено', isCurrent: url === location.href });
+        continue;
+      }
+
+      // ── ПРЕДФИЛЬТР: пропускаем страницы без признаков имён ──
+      if (!hasNameLikePatterns(pageData.text)) {
+        pages.push({
+          url, title: pageData.title, items: [],
+          skipped: true, // помечаем как пропущенную
+          isCurrent: url === location.href
+        });
+        skippedByFilter++;
+        continue; // НЕ тратим API-запрос, НЕ делаем задержку
+      }
+
+      const slezaResult = await checkWithSleza(pageData.text);
+      const items = (slezaResult.items || []).map(parseSlezaItem);
+      const checked = items.map(item => ({ ...item, ...checkMarkingNearby(pageData.text, item.name), pageUrl: url }));
+
+      const unmarkedCount = checked.filter(x => !x.hasMarking).length;
+      totalFound += checked.length;
+      totalUnmarked += unmarkedCount;
+
+      pages.push({
+        url, title: pageData.title, items: checked,
+        isCurrent: url === location.href
+      });
+
+      // Задержка перед следующим запросом (только если был API-запрос)
+      if (i < urls.length - 1 && !scanCancelled) {
+        await new Promise(r => setTimeout(r, SLEZA_DELAY_MS));
+      }
+    }
+
+    if (scanCancelled) {
+      const bd = document.getElementById('sz-bd');
+      if (bd) bd.innerHTML = `<div class="sz-err">⚠ Сканирование отменено<br><br><small>Просканировано ${pages.length} страниц</small></div>`;
+      return;
+    }
+
+    // 3. AI-анализ остальных законов (только на главной)
+    showProgress({ phase: 'ai', current: urls.length, total: urls.length, found: { total: totalFound, unmarked: totalUnmarked } });
+    const c = getCurrentPageContent();
+
+    // ЕГРЮЛ-проверка по всему собранному тексту (с любой страницы)
+    const allPagesText = pages.map(p => p.items.length > 0 ? '' : '').join('') + c.bodyText + ' ' + c.footer + ' ' + c.header;
+    const ids = extractIdentifiers(allPagesText);
+    let egrulResult = null;
+    if (ids.ogrn || ids.inn) {
+      egrulResult = await checkEgrul(ids.ogrn || ids.inn);
+    }
+    const egrul = { checked: true, ids, result: egrulResult };
+
+    const aiData = await runAIAnalysis(c, egrul);
+
+    renderResults({ mode: 'full', origin, hostname, pages, aiData, source: urlList.source, egrul, stats });
+  }
+
+  async function runAIAnalysis(c, egrul) {
+    // Загружаем подстраницы политики/оферты для AI
+    const allLinks = [...c.policyLinks, ...c.offerLinks, ...c.returnLinks, ...c.aboutLinks];
+    const fetched = {};
+    if (allLinks.length > 0) {
+      const results = await Promise.all(allLinks.map(l => fetchUrl(l.href)));
+      const tag = (links, label) => {
+        const r = links.map(l => {
+          const f = results.find(x => x.url === l.href);
+          return f && f.ok ? { url: l.href, text: f.text.slice(0, 3000) } : null;
+        }).filter(Boolean);
+        if (r.length > 0) fetched[label] = r;
+      };
+      tag(c.policyLinks, 'policy');
+      tag(c.offerLinks, 'offer');
+      tag(c.returnLinks, 'return');
+      tag(c.aboutLinks, 'about');
+    }
+
+    let msg = `URL: ${c.url}\nЗаголовок: ${c.title}\n\nШАПКА: ${c.header}\nПОДВАЛ: ${c.footer}\n\nТЕКСТ:\n${c.bodyText}\n\nTracking: ${c.hasAdScripts?'ЕСТЬ':'нет'}\nCookie-баннер: ${c.hasCookieBanner?'ЕСТЬ':'нет'}\n`;
+
+    // Передаём результат проверки реквизитов через ЕГРЮЛ
+    if (egrul && egrul.checked) {
+      msg += `\n═══ ПРОВЕРКА РЕКВИЗИТОВ ЧЕРЕЗ ЕГРЮЛ/ЕГРИП (149-ФЗ) ═══\n`;
+      if (egrul.ids.inn || egrul.ids.ogrn) {
+        msg += `Найдено на сайте: ИНН=${egrul.ids.inn||'—'}, ОГРН=${egrul.ids.ogrn||'—'}\n`;
+        if (egrul.result && egrul.result.found && egrul.result.parsed) {
+          const p = egrul.result.parsed;
+          msg += `Сверка с ФНС: НАЙДЕНО в реестре\n`;
+          msg += `  Тип: ${p.type === 'ip' ? 'ИП' : 'ЮЛ'}\n`;
+          msg += `  Название: ${p.name}\n`;
+          if (p.address) msg += `  Адрес: ${p.address}\n`;
+          msg += `  Статус: ${p.isActive ? 'ДЕЙСТВУЮЩАЯ' : 'ПРЕКРАЩЕНА (' + p.reason + ')'}\n`;
+          if (p.regDate) msg += `  Дата регистрации: ${p.regDate}\n`;
+          msg += `→ Для 149-ФЗ: реквизиты ВЕРИФИЦИРОВАНЫ через ФНС. Если организация действующая — статус "ok".\n`;
+          if (!p.isActive) msg += `→ ВНИМАНИЕ: организация ПРЕКРАЩЕНА — это критическое нарушение.\n`;
+        } else {
+          msg += `Сверка с ФНС: НЕ НАЙДЕНО — ${egrul.result?.error || 'данные не вернулись'}\n`;
+          msg += `→ Для 149-ФЗ: указанный на сайте ИНН/ОГРН не найден в ЕГРЮЛ — это нарушение (фейковые реквизиты или ошибка).\n`;
+        }
+      } else {
+        msg += `Реквизиты (ИНН/ОГРН) НЕ НАЙДЕНЫ на сайте\n`;
+        msg += `→ Для 149-ФЗ ст.10: явное нарушение, реквизиты владельца обязательны.\n`;
+      }
+      msg += `═══════════════════════════════════════════\n`;
+    }
+
+    if (fetched.policy) msg += `\n=== ПОЛИТИКА ===\n${fetched.policy.map(p => `${p.url}\n${p.text}`).join('\n---\n')}\n`;
+    else msg += `\n[ПОЛИТИКА: не найдена]\n`;
+    if (fetched.offer) msg += `\n=== ОФЕРТА ===\n${fetched.offer.map(p => `${p.url}\n${p.text.slice(0,1500)}`).join('\n---\n')}\n`;
+    else msg += `\n[ОФЕРТА: не найдена]\n`;
+    if (fetched.about) msg += `\n=== О КОМПАНИИ ===\n${fetched.about.map(p => `${p.url}\n${p.text.slice(0,1500)}`).join('\n---\n')}\n`;
+
+    // ── Локальный чек-лист 152-ФЗ ст.18.1 (7 пунктов) ──
+    const policyText = (fetched.policy || []).map(p => p.text).join('\n\n');
+    const result152 = check152FZ(policyText);
+    if (result152.status !== 'no_policy') {
+      msg += `\n═══ ЛОКАЛЬНЫЙ ЧЕК-ЛИСТ 152-ФЗ ст.18.1 ═══\n`;
+      msg += `Найдено пунктов: ${result152.found} из ${result152.total}\n`;
+      result152.items.forEach(item => {
+        msg += `${item.present ? '✓' : '✗'} ${item.label}\n`;
+      });
+      msg += `Локальный вывод: ${result152.status === 'ok' ? 'политика полная' : result152.status === 'risk' ? 'политика неполная — есть пробелы' : 'критические пробелы'}\n`;
+      msg += `→ Используй этот чек-лист как ОСНОВУ для 152-ФЗ. Не пересчитывай заново.\n`;
+      msg += `═══════════════════════════════════════════\n`;
+    } else {
+      msg += `\n═══ 152-ФЗ: ПОЛИТИКА НЕ НАЙДЕНА ═══\nЭто явное нарушение — на сайте должна быть политика конфиденциальности.\n═══════════════════════════════════════════\n`;
+    }
+
+    return new Promise(resolve => {
+      GM_xmlhttpRequest({
+        method: 'POST',
+        url: 'https://api.groq.com/openai/v1/chat/completions',
+        headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + GROQ_KEY },
+        data: JSON.stringify({
+          model: 'llama-3.3-70b-versatile',
+          max_tokens: 2500,
+          temperature: 0.1,
+          messages: [
+            { role: 'system', content: SYSTEM },
+            { role: 'user', content: msg }
+          ]
+        }),
+        onload(r) {
+          try {
+            const j = JSON.parse(r.responseText);
+            if (j.error) throw new Error(j.error.message);
+            const txt = j.choices?.[0]?.message?.content || '';
+            const m = txt.match(/\{[\s\S]*\}/);
+            if (!m) throw new Error('parse');
+            const parsed = JSON.parse(m[0]);
+            resolve({ ...parsed, fetched, result152 });
+          } catch(e) { resolve({ error: e.message, fetched, result152 }); }
+        },
+        onerror() { resolve({ error: 'net', fetched, result152 }); }
+      });
+    });
+  }
+
+  const ST = {
+    violation:{label:'НАРУШЕНИЕ',cls:'violation'},
+    risk:     {label:'РИСК',     cls:'risk'},
+    ok:       {label:'В ПОРЯДКЕ',cls:'ok'},
+    unknown:  {label:'НЕТ ДАННЫХ',cls:'unknown'},
+  };
+
+  function renderResults({ mode, origin, hostname, pages, aiData, source, egrul, stats }) {
+    // Аггрегация по реестру
+    const allItems = pages.flatMap(p => p.items);
+    const inoItems = allItems.filter(i => i.category === 'inoagent');
+    const extItems = allItems.filter(i => i.category === 'extremist' || i.category === 'terrorist');
+    const inoUnmarked = inoItems.filter(i => !i.hasMarking);
+    const extUnmarked = extItems.filter(i => !i.hasMarking);
+
+    const aiChecks = (aiData && aiData.checks) || [];
+    const totalSlezaUnmarked = inoUnmarked.length + extUnmarked.length;
+    const totalAIViolations = aiChecks.filter(c => c.status === 'violation').length;
+    const totalViolations = totalSlezaUnmarked + totalAIViolations;
+
+    let riskCls, riskTitle, riskDesc;
+    if (totalViolations >= 5 || totalSlezaUnmarked >= 3) {
+      riskCls = 'high'; riskTitle = 'ВЫСОКИЙ РИСК'; riskDesc = 'Множественные нарушения по сайту. Срочно требуется маркировка.';
+    } else if (totalViolations >= 1) {
+      riskCls = 'medium'; riskTitle = 'СРЕДНИЙ РИСК'; riskDesc = 'Есть нарушения, требуется устранение.';
+    } else {
+      riskCls = 'low'; riskTitle = 'НИЗКИЙ РИСК'; riskDesc = 'Критических нарушений не выявлено.';
+    }
+
+    const pagesWithIssues = pages.filter(p => p.items.some(i => !i.hasMarking));
+    const okPages = pages.filter(p => p.items.length > 0 && !p.items.some(i => !i.hasMarking));
+
+    const bd = document.getElementById('sz-bd');
+    bd.innerHTML = `
+      <div class="sz-sum ${riskCls}">
+        <div>
+          <div class="sz-sl">Сайт: <span>${aiData?.site_name || hostname}</span>${aiData?.site_type ? ` · ${aiData.site_type}` : ''}</div>
+          <div class="sz-rt c-${riskCls}">${riskTitle}</div>
+          <div class="sz-rd">${aiData?.summary || riskDesc}</div>
+        </div>
+        <div>
+          <div class="sz-sc c-${riskCls}">${totalViolations}</div>
+          <div class="sz-scl">НАРУШЕНИЙ</div>
+        </div>
+      </div>
+
+      ${mode === 'full' ? `
+      <div class="sz-stats-row">
+        <div class="sz-stat">
+          <div class="sz-stat-num">${pages.length}</div>
+          <div class="sz-stat-lbl">Страниц проверено</div>
+        </div>
+        <div class="sz-stat">
+          <div class="sz-stat-num ${allItems.length > 0 ? 'warn' : 'ok'}">${allItems.length}</div>
+          <div class="sz-stat-lbl">Упоминаний</div>
+        </div>
+        <div class="sz-stat">
+          <div class="sz-stat-num ${totalSlezaUnmarked > 0 ? 'bad' : 'ok'}">${totalSlezaUnmarked}</div>
+          <div class="sz-stat-lbl">Без маркировки</div>
+        </div>
+        <div class="sz-stat">
+          <div class="sz-stat-num ${pagesWithIssues.length > 0 ? 'bad' : 'ok'}">${pagesWithIssues.length}</div>
+          <div class="sz-stat-lbl">Проблемных стр.</div>
+        </div>
+      </div>
+      <div style="font-family:'Courier New',monospace;font-size:10px;color:#64748b;margin-bottom:14px;text-align:center;line-height:1.7">
+        // источник: ${source === 'sitemap' ? 'sitemap.xml' : source === 'sitemap-index' ? 'sitemap-index' : 'обход страниц'} · максимум: ${MAX_PAGES} страниц
+        ${stats ? `<br>// приоритизация: <span style="color:#4ade80">📰 ${stats.highScanned} из ${stats.totalHighFound} контентн.</span> · <span style="color:#94a3b8">🏢 ${stats.mid} корпорат.</span>${stats.low > 0 ? ` · <span style="color:#64748b">📄 ${stats.low} прочих</span>` : ''}${stats.skipped > 0 ? ` · <span style="color:#475569">✗ ${stats.skipped} тех.страниц пропущено</span>` : ''}` : ''}
+        ${(() => {
+          const skippedByFilter = pages.filter(p => p.skipped).length;
+          const apiCalled = pages.length - skippedByFilter - pages.filter(p => p.error).length;
+          if (skippedByFilter === 0) return '';
+          return `<br>// предфильтр: <span style="color:#60a5fa">🔍 ${apiCalled} API-запросов</span> · <span style="color:#4ade80">⚡ ${skippedByFilter} страниц пропущено без API</span> · экономия ${Math.round(skippedByFilter / pages.length * 100)}%`;
+        })()}
+      </div>
+      ` : ''}
+
+      <div class="sz-acts">
+        <button class="sz-abtn" onclick="window.print()">⬇ Печать / PDF</button>
+      </div>
+
+      <div class="sz-cl">// результаты по 7 законам</div>
+      <div class="sz-checks">
+        ${renderSlezaCheck(inoItems, 'Маркировка иноагентов', 'ФЗ №121, №255-ФЗ', '40 000 — 500 000 руб.', pages, 'inoagent')}
+        ${renderSlezaCheck(extItems, 'Маркировка экстремистов / террористов', 'ст.13.15 КоАП, ФЗ №114', 'до 500 000 руб.', pages, 'extremist')}
+        ${aiChecks.map((ch, i) => renderAICheck(ch, i, egrul, aiData?.result152)).join('')}
+      </div>
+
+      <div class="sz-cta">
+        <div>
+          <div class="sz-ctat">Автомаркировка на всех страницах сразу?</div>
+          <div class="sz-ctas">JS-скрипт Слеза + полный реестр + автообновления 24/7</div>
+        </div>
+        <div class="sz-ctal">sleza.media →</div>
+      </div>
+
+      <div class="sz-disc">
+        // Иноагенты/экстремисты: официальный API sleza.media (актуально)<br>
+        // Остальные законы: AI-анализ (предварительная оценка)<br>
+        // ${pages.length} страниц проверено · полный аудит — sleza.media
+      </div>`;
+
+    // Обработчики
+    bd.querySelectorAll('.sz-loc-btn[data-check-idx]').forEach(btn => {
+      btn.onclick = (e) => {
+        e.preventDefault();
+        const idx = parseInt(btn.getAttribute('data-check-idx'), 10);
+        const ch = aiChecks[idx];
+        if (!ch) return;
+        const target = findElementByText(ch.found_text);
+        if (target) { setModalDimmed(true); highlightElement(target); }
+      };
+    });
+    bd.querySelectorAll('[data-find-name][data-page-url]').forEach(btn => {
+      btn.onclick = (e) => {
+        e.preventDefault();
+        const url = btn.getAttribute('data-page-url');
+        const name = decodeURIComponent(btn.getAttribute('data-find-name'));
+        if (url === location.href) {
+          const target = findElementByText(name);
+          if (target) { setModalDimmed(true); highlightElement(target); }
+        } else {
+          window.open(url, '_blank');
+        }
+      };
+    });
+  }
+
+  function renderSlezaCheck(items, title, code, fine, pages, type) {
+    const unmarked = items.filter(i => !i.hasMarking);
+    const marked = items.filter(i => i.hasMarking);
+
+    let status, issue, action;
+    if (items.length === 0) {
+      status = 'ok'; issue = 'Упоминаний не найдено на сайте'; action = '—';
+    } else if (unmarked.length === 0) {
+      status = 'ok';
+      issue = `${items.length} ${plural(items.length, 'упоминание','упоминания','упоминаний')} с корректной маркировкой`;
+      action = 'Поддерживайте маркировку при новых публикациях';
+    } else {
+      status = 'violation';
+      issue = `${unmarked.length} ${plural(unmarked.length, 'упоминание','упоминания','упоминаний')} БЕЗ маркировки на ${countPagesWith(pages, type)} ${plural(countPagesWith(pages, type), 'странице','страницах','страницах')}`;
+      action = 'Добавить маркировку на каждой указанной странице';
+    }
+
+    const st = ST[status];
+    const pagesBlock = items.length > 0 ? renderPagesList(pages, type) : '';
+
+    return `
+      <div class="sz-check ${st.cls}">
+        <div class="sz-ct">
+          <div>
+            <div class="sz-ln">${title}</div>
+            <div class="sz-lc">${code} · API Слезы</div>
+          </div>
+          <div class="sz-pill ${st.cls}">${st.label}</div>
+        </div>
+        <div class="sz-grid">
+          <div class="sz-full">
+            <div class="sz-fl">// результат</div>
+            <div class="sz-fv iss">${issue}</div>
+            ${pagesBlock}
+          </div>
+          <div>
+            <div class="sz-fl">// штраф</div>
+            <div class="sz-fv">${fine}</div>
+          </div>
+          <div>
+            <div class="sz-fl">// что нужно сделать</div>
+            <div class="sz-fv">${action}</div>
+          </div>
+        </div>
+      </div>`;
+  }
+
+  function countPagesWith(pages, type) {
+    return pages.filter(p => p.items.some(i =>
+      !i.hasMarking && (type === 'inoagent' ? i.category === 'inoagent' : (i.category === 'extremist' || i.category === 'terrorist'))
+    )).length;
+  }
+
+  function renderPagesList(pages, type) {
+    const filtered = pages.filter(p => p.items.some(i =>
+      type === 'inoagent' ? i.category === 'inoagent' : (i.category === 'extremist' || i.category === 'terrorist')
+    ));
+    if (filtered.length === 0) return '';
+
+    return `<div class="sz-pages-list">
+      ${filtered.map(p => {
+        const relevant = p.items.filter(i =>
+          type === 'inoagent' ? i.category === 'inoagent' : (i.category === 'extremist' || i.category === 'terrorist')
+        );
+        const unmarked = relevant.filter(i => !i.hasMarking);
+        const marked = relevant.filter(i => i.hasMarking);
+        const isBad = unmarked.length > 0;
+        const shortUrl = p.url.replace(location.origin, '') || '/';
+
+        return `<div class="sz-page-item ${isBad ? 'bad' : ''}">
+          <a class="sz-page-url" href="${p.url}" target="_blank">${shortUrl}${p.isCurrent ? ' · текущая' : ''}</a>
+          <div style="font-family:'Courier New',monospace;font-size:9px;color:#64748b;margin-bottom:4px">
+            ${unmarked.length > 0 ? `<span style="color:#f87171;font-weight:700">✗ ${unmarked.length} без маркировки</span>` : ''}
+            ${unmarked.length > 0 && marked.length > 0 ? ' · ' : ''}
+            ${marked.length > 0 ? `<span style="color:#4ade80">✓ ${marked.length} с маркировкой</span>` : ''}
+          </div>
+          ${unmarked.length > 0 ? `<div class="sz-page-violations">
+            ${unmarked.map(item => `
+              <div class="sz-page-violation">
+                <span class="name">${item.name}</span>
+                <span class="mark">→ «${item.marking.slice(0, 60)}${item.marking.length > 60 ? '...' : ''}»</span>
+                ${p.isCurrent ? `<button data-find-name="${encodeURIComponent(item.name)}" data-page-url="${p.url}" style="font-family:inherit;font-size:9px;background:#1a2235;border:1px solid #2d3f5a;color:#60a5fa;padding:1px 6px;border-radius:3px;cursor:pointer">📍</button>` : ''}
+              </div>
+            `).join('')}
+          </div>` : ''}
+        </div>`;
+      }).join('')}
+    </div>`;
+  }
+
+  function plural(n, one, two, many) {
+    const m = n % 10; const m2 = n % 100;
+    if (m2 >= 11 && m2 <= 14) return many;
+    if (m === 1) return one;
+    if (m >= 2 && m <= 4) return two;
+    return many;
+  }
+
+  function renderAICheck(ch, i, egrul, result152) {
+    const st = ST[ch.status] || ST.unknown;
+    const showLoc = ch.status !== 'ok' && ch.status !== 'unknown' && ch.found_text && !ch.found_text.toLowerCase().includes('отсутств');
+    const showQuote = ch.found_text && !ch.found_text.toLowerCase().includes('отсутств') && ch.status !== 'ok';
+
+    // Блок верификации ЕГРЮЛ — только для 149-ФЗ
+    let egrulBlock = '';
+    if (egrul && egrul.checked && (ch.law_code || '').includes('149-ФЗ')) {
+      egrulBlock = renderEgrulBlock(egrul);
+    }
+
+    // Блок чек-листа 152-ФЗ
+    let block152 = '';
+    if (result152 && (ch.law_code || '').includes('152-ФЗ')) {
+      block152 = render152Block(result152);
+    }
+
+    // Если есть локальный чек 152-ФЗ — переопределяем статус карточки
+    let effectiveStatus = ch.status;
+    let effectiveLabel = ST[ch.status]?.label || 'НЕТ ДАННЫХ';
+    let effectiveCls = ST[ch.status]?.cls || 'unknown';
+    if (result152 && (ch.law_code || '').includes('152-ФЗ')) {
+      if (result152.status === 'ok') { effectiveStatus = 'ok'; effectiveLabel = ST.ok.label; effectiveCls = ST.ok.cls; }
+      else if (result152.status === 'risk') { effectiveStatus = 'risk'; effectiveLabel = ST.risk.label; effectiveCls = ST.risk.cls; }
+      else if (result152.status === 'violation' || result152.status === 'no_policy') { effectiveStatus = 'violation'; effectiveLabel = ST.violation.label; effectiveCls = ST.violation.cls; }
+    }
+
+    return `
+      <div class="sz-check ${effectiveCls}">
+        <div class="sz-ct">
+          <div>
+            <div class="sz-ln">${ch.law}</div>
+            <div class="sz-lc">${ch.law_code}${egrulBlock ? ' · ЕГРЮЛ' : ''}${block152 ? ' · чек-лист' : ''}</div>
+          </div>
+          <div class="sz-pill ${effectiveCls}">${effectiveLabel}</div>
+        </div>
+        <div class="sz-grid">
+          <div class="sz-full">
+            <div class="sz-fl">// что обнаружено</div>
+            <div class="sz-fv iss">${ch.issue || '—'}</div>
+            ${egrulBlock}
+            ${block152}
+            ${showLoc ? `<button class="sz-loc-btn" data-check-idx="${i}"><span class="sz-loc-icon">📍</span><span class="sz-loc-label">${ch.location || 'на странице'}</span></button>` : ''}
+            ${showQuote ? `<div class="sz-quote">"${ch.found_text}"</div>` : ''}
+          </div>
+          <div>
+            <div class="sz-fl">// штраф</div>
+            <div class="sz-fv">${ch.fine || '—'}</div>
+          </div>
+          <div>
+            <div class="sz-fl">// что нужно сделать</div>
+            <div class="sz-fv">${ch.action || '—'}</div>
+          </div>
+        </div>
+      </div>`;
+  }
+
+  function render152Block(r) {
+    // Политика не найдена
+    if (r.status === 'no_policy') {
+      return `<div class="sz-egrul-block bad">
+        <div class="sz-egrul-title">⚠ Политика конфиденциальности НЕ НАЙДЕНА</div>
+        <div class="sz-egrul-desc">По 152-ФЗ оператор обязан опубликовать политику конфиденциальности с 7 обязательными пунктами (ст. 18.1).</div>
+      </div>`;
+    }
+
+    const cls = r.status === 'ok' ? 'good' : r.status === 'risk' ? 'warn' : 'bad';
+    const icon = r.status === 'ok' ? '✓' : r.status === 'risk' ? '⚠' : '✗';
+    const title = r.status === 'ok' ? `Политика полная (${r.found} из ${r.total})` :
+                  r.status === 'risk' ? `Политика неполная (${r.found} из ${r.total})` :
+                  `Критические пробелы (${r.found} из ${r.total})`;
+
+    const items = r.items.map(item =>
+      `<div class="sz-152-row">
+        <span class="sz-152-icon ${item.present ? 'ok' : 'miss'}">${item.present ? '✓' : '✗'}</span>
+        <span class="sz-152-label ${item.present ? '' : 'miss'}">${item.label}</span>
+      </div>`
+    ).join('');
+
+    const missingItems = r.items.filter(i => !i.present);
+    const desc = missingItems.length > 0
+      ? `Отсутствует: ${missingItems.map(i => i.label.toLowerCase()).join('; ')}.`
+      : 'Политика содержит все обязательные пункты по ст. 18.1 152-ФЗ.';
+
+    return `<div class="sz-egrul-block ${cls}">
+      <div class="sz-egrul-title">${icon} ${title}</div>
+      <div class="sz-152-list">${items}</div>
+      <div class="sz-egrul-desc">${desc}</div>
+    </div>`;
+  }
+
+  function renderEgrulBlock(egrul) {
+    const ids = egrul.ids;
+    const res = egrul.result;
+
+    // Реквизиты не найдены на сайте
+    if (!ids.inn && !ids.ogrn) {
+      return `<div class="sz-egrul-block bad">
+        <div class="sz-egrul-title">⚠ Реквизиты НЕ НАЙДЕНЫ на сайте</div>
+        <div class="sz-egrul-desc">По 149-ФЗ ст.10 ИНН и ОГРН должны быть размещены публично — обычно в подвале или на странице "О компании".</div>
+      </div>`;
+    }
+
+    // Реквизиты найдены, но не проверены или не нашлись в ФНС
+    if (!res || !res.found) {
+      return `<div class="sz-egrul-block warn">
+        <div class="sz-egrul-title">⚠ ИНН/ОГРН не подтверждён в ФНС</div>
+        <div class="sz-egrul-row"><span>На сайте:</span> ИНН ${ids.inn||'—'}, ОГРН ${ids.ogrn||'—'}</div>
+        <div class="sz-egrul-row"><span>Ошибка:</span> ${res?.error || 'данные не вернулись'}</div>
+        <div class="sz-egrul-desc">Возможно: ИНН неверный, организация ликвидирована, или сервис временно недоступен.</div>
+      </div>`;
+    }
+
+    // ВСЁ ОК
+    const p = res.parsed;
+    const cls = p.isActive ? 'good' : 'bad';
+    const statusIcon = p.isActive ? '✓' : '✗';
+    return `<div class="sz-egrul-block ${cls}">
+      <div class="sz-egrul-title">${statusIcon} Реквизиты сверены с ФНС</div>
+      <div class="sz-egrul-row"><span>Тип:</span> ${p.type === 'ip' ? 'Индивидуальный предприниматель' : 'Юридическое лицо'}</div>
+      <div class="sz-egrul-row"><span>Название:</span> ${p.name || '—'}</div>
+      ${p.inn ? `<div class="sz-egrul-row"><span>ИНН:</span> ${p.inn}</div>` : ''}
+      ${p.ogrn ? `<div class="sz-egrul-row"><span>ОГРН:</span> ${p.ogrn}</div>` : ''}
+      ${p.kpp ? `<div class="sz-egrul-row"><span>КПП:</span> ${p.kpp}</div>` : ''}
+      ${p.address ? `<div class="sz-egrul-row"><span>Адрес:</span> ${p.address}</div>` : ''}
+      ${p.regDate ? `<div class="sz-egrul-row"><span>Дата рег.:</span> ${p.regDate}</div>` : ''}
+      <div class="sz-egrul-row"><span>Статус:</span> <strong class="${p.isActive ? 'ok' : 'bad'}">${p.isActive ? 'ДЕЙСТВУЮЩАЯ' : 'ПРЕКРАЩЕНА'}</strong></div>
+      ${!p.isActive && p.reason ? `<div class="sz-egrul-desc">${p.reason} — критическое нарушение, сайт нельзя использовать для коммерческой деятельности.</div>` : ''}
+    </div>`;
+  }
+})();
