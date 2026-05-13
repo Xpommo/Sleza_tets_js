@@ -25,10 +25,14 @@
   // ── Настройки краулера ────────────────────────
   const MAX_PAGES        = 100;  // максимум страниц для скана (было 30)
   const MAX_DEPTH        = 2;    // глубина обхода если нет sitemap
-  const BATCH_SIZE       = 10;   // страниц в одном API-запросе (батчинг)
+  // BATCH_SIZE зарезервирован для будущего батч-режима Sleza; сейчас не используется
   const SLEZA_DELAY_MS   = 1100; // 1 запрос в секунду (лимит API)
   const FETCH_TIMEOUT    = 8000; // таймаут загрузки страницы
   // ──────────────────────────────────────────────
+
+  function escapeHtml(s) {
+    return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  }
 
   const MARK_PATTERNS = [
     'иностранн','иноагент','экстремист','террорист',
@@ -145,8 +149,10 @@
       r.ogrn = ul.ОГРН || '';
       r.kpp = ul.КПП || '';
       r.regDate = ul.ДатаОГРН || ul.ДатаРег || '';
-      const addr = ul.СвАдресЮЛ || ul.АдресРФ;
-      if (addr) r.address = addr.АдресПолн || addr.АдресРФ?.АдресПолн || '';
+      const адресЮЛ = ul.СвАдресЮЛ;
+      const адресРФ = ul.АдресРФ;
+      if (адресЮЛ) r.address = адресЮЛ.АдресПолн || адресЮЛ.АдресРФ?.АдресПолн || '';
+      else if (адресРФ) r.address = адресРФ.АдресПолн || '';
       if (ul.СвПрекрЮЛ || ul.СвСтатус?.КодСтатусЮЛ === '5' || ul.СвЛикв) {
         r.isActive = false;
         r.reason = ul.СвПрекрЮЛ?.НаимСпсПрекрЮЛ || 'Деятельность прекращена';
@@ -837,9 +843,10 @@
           <div><span class="lbl">найдено упоминаний:</span> <span class="num ${found.total === 0 ? 'zero' : ''}">${found.total}</span></div>
           <div><span class="lbl">без маркировки:</span> <span class="num ${found.unmarked === 0 ? 'zero' : ''}">${found.unmarked}</span></div>
         </div>` : ''}
-        <button class="sz-cancel-btn" onclick="window.szCancel && window.szCancel()">✕ Отменить</button>
+        <button class="sz-cancel-btn" id="sz-cancel-btn">✕ Отменить</button>
       </div>`;
-    window.szCancel = () => { scanCancelled = true; };
+    const cancelBtn = document.getElementById('sz-cancel-btn');
+    if (cancelBtn) cancelBtn.addEventListener('click', () => { scanCancelled = true; });
   }
 
   // ── Сценарий: одна страница ───────────────────
@@ -935,6 +942,7 @@
     let totalUnmarked = 0;
     let totalFound = 0;
     let skippedByFilter = 0; // счётчик пропущенных предфильтром
+    let allPagesRawText = ''; // накапливаем хвосты страниц для поиска ИНН/ОГРН в подвалах
 
     for (let i = 0; i < urls.length; i++) {
       if (scanCancelled) break;
@@ -986,6 +994,9 @@
       totalFound += checked.length;
       totalUnmarked += unmarkedCount;
 
+      // Хвост страницы (1500 симв.) — подвалы часто содержат ИНН/ОГРН
+      allPagesRawText += ' ' + pageData.text.slice(-1500);
+
       pages.push({
         url, title: pageData.title, items: checked,
         isCurrent: url === location.href
@@ -1007,8 +1018,8 @@
     showProgress({ phase: 'ai', current: urls.length, total: urls.length, found: { total: totalFound, unmarked: totalUnmarked } });
     const c = getCurrentPageContent();
 
-    // ЕГРЮЛ-проверка по всему собранному тексту (с любой страницы)
-    const allPagesText = pages.map(p => p.items.length > 0 ? '' : '').join('') + c.bodyText + ' ' + c.footer + ' ' + c.header;
+    // ЕГРЮЛ-проверка: объединяем хвосты всех страниц + DOM текущей (подвал = главный источник ИНН/ОГРН)
+    const allPagesText = allPagesRawText + ' ' + c.bodyText + ' ' + c.footer + ' ' + c.header;
     const ids = extractIdentifiers(allPagesText);
     let egrulResult = null;
     if (ids.ogrn || ids.inn) {
@@ -1156,9 +1167,9 @@
     bd.innerHTML = `
       <div class="sz-sum ${riskCls}">
         <div>
-          <div class="sz-sl">Сайт: <span>${aiData?.site_name || hostname}</span>${aiData?.site_type ? ` · ${aiData.site_type}` : ''}</div>
+          <div class="sz-sl">Сайт: <span>${escapeHtml(aiData?.site_name || hostname)}</span>${aiData?.site_type ? ` · ${escapeHtml(aiData.site_type)}` : ''}</div>
           <div class="sz-rt c-${riskCls}">${riskTitle}</div>
-          <div class="sz-rd">${aiData?.summary || riskDesc}</div>
+          <div class="sz-rd">${escapeHtml(aiData?.summary || riskDesc)}</div>
         </div>
         <div>
           <div class="sz-sc c-${riskCls}">${totalViolations}</div>
@@ -1327,9 +1338,9 @@
           ${unmarked.length > 0 ? `<div class="sz-page-violations">
             ${unmarked.map(item => `
               <div class="sz-page-violation">
-                <span class="name">${item.name}</span>
-                <span class="mark">→ «${item.marking.slice(0, 60)}${item.marking.length > 60 ? '...' : ''}»</span>
-                ${p.isCurrent ? `<button data-find-name="${encodeURIComponent(item.name)}" data-page-url="${p.url}" style="font-family:inherit;font-size:9px;background:#1a2235;border:1px solid #2d3f5a;color:#60a5fa;padding:1px 6px;border-radius:3px;cursor:pointer">📍</button>` : ''}
+                <span class="name">${escapeHtml(item.name)}</span>
+                <span class="mark">→ «${escapeHtml(item.marking.slice(0, 60))}${item.marking.length > 60 ? '...' : ''}»</span>
+                ${p.isCurrent ? `<button data-find-name="${encodeURIComponent(item.name)}" data-page-url="${escapeHtml(p.url)}" style="font-family:inherit;font-size:9px;background:#1a2235;border:1px solid #2d3f5a;color:#60a5fa;padding:1px 6px;border-radius:3px;cursor:pointer">📍</button>` : ''}
               </div>
             `).join('')}
           </div>` : ''}
@@ -1377,27 +1388,27 @@
       <div class="sz-check ${effectiveCls}">
         <div class="sz-ct">
           <div>
-            <div class="sz-ln">${ch.law}</div>
-            <div class="sz-lc">${ch.law_code}${egrulBlock ? ' · ЕГРЮЛ' : ''}${block152 ? ' · чек-лист' : ''}</div>
+            <div class="sz-ln">${escapeHtml(ch.law)}</div>
+            <div class="sz-lc">${escapeHtml(ch.law_code)}${egrulBlock ? ' · ЕГРЮЛ' : ''}${block152 ? ' · чек-лист' : ''}</div>
           </div>
           <div class="sz-pill ${effectiveCls}">${effectiveLabel}</div>
         </div>
         <div class="sz-grid">
           <div class="sz-full">
             <div class="sz-fl">// что обнаружено</div>
-            <div class="sz-fv iss">${ch.issue || '—'}</div>
+            <div class="sz-fv iss">${escapeHtml(ch.issue || '—')}</div>
             ${egrulBlock}
             ${block152}
-            ${showLoc ? `<button class="sz-loc-btn" data-check-idx="${i}"><span class="sz-loc-icon">📍</span><span class="sz-loc-label">${ch.location || 'на странице'}</span></button>` : ''}
-            ${showQuote ? `<div class="sz-quote">"${ch.found_text}"</div>` : ''}
+            ${showLoc ? `<button class="sz-loc-btn" data-check-idx="${i}"><span class="sz-loc-icon">📍</span><span class="sz-loc-label">${escapeHtml(ch.location || 'на странице')}</span></button>` : ''}
+            ${showQuote ? `<div class="sz-quote">"${escapeHtml(ch.found_text)}"</div>` : ''}
           </div>
           <div>
             <div class="sz-fl">// штраф</div>
-            <div class="sz-fv">${ch.fine || '—'}</div>
+            <div class="sz-fv">${escapeHtml(ch.fine || '—')}</div>
           </div>
           <div>
             <div class="sz-fl">// что нужно сделать</div>
-            <div class="sz-fv">${ch.action || '—'}</div>
+            <div class="sz-fv">${escapeHtml(ch.action || '—')}</div>
           </div>
         </div>
       </div>`;
@@ -1453,8 +1464,8 @@
     if (!res || !res.found) {
       return `<div class="sz-egrul-block warn">
         <div class="sz-egrul-title">⚠ ИНН/ОГРН не подтверждён в ФНС</div>
-        <div class="sz-egrul-row"><span>На сайте:</span> ИНН ${ids.inn||'—'}, ОГРН ${ids.ogrn||'—'}</div>
-        <div class="sz-egrul-row"><span>Ошибка:</span> ${res?.error || 'данные не вернулись'}</div>
+        <div class="sz-egrul-row"><span>На сайте:</span> ИНН ${escapeHtml(ids.inn||'—')}, ОГРН ${escapeHtml(ids.ogrn||'—')}</div>
+        <div class="sz-egrul-row"><span>Ошибка:</span> ${escapeHtml(res?.error || 'данные не вернулись')}</div>
         <div class="sz-egrul-desc">Возможно: ИНН неверный, организация ликвидирована, или сервис временно недоступен.</div>
       </div>`;
     }
@@ -1466,14 +1477,14 @@
     return `<div class="sz-egrul-block ${cls}">
       <div class="sz-egrul-title">${statusIcon} Реквизиты сверены с ФНС</div>
       <div class="sz-egrul-row"><span>Тип:</span> ${p.type === 'ip' ? 'Индивидуальный предприниматель' : 'Юридическое лицо'}</div>
-      <div class="sz-egrul-row"><span>Название:</span> ${p.name || '—'}</div>
-      ${p.inn ? `<div class="sz-egrul-row"><span>ИНН:</span> ${p.inn}</div>` : ''}
-      ${p.ogrn ? `<div class="sz-egrul-row"><span>ОГРН:</span> ${p.ogrn}</div>` : ''}
-      ${p.kpp ? `<div class="sz-egrul-row"><span>КПП:</span> ${p.kpp}</div>` : ''}
-      ${p.address ? `<div class="sz-egrul-row"><span>Адрес:</span> ${p.address}</div>` : ''}
-      ${p.regDate ? `<div class="sz-egrul-row"><span>Дата рег.:</span> ${p.regDate}</div>` : ''}
+      <div class="sz-egrul-row"><span>Название:</span> ${escapeHtml(p.name || '—')}</div>
+      ${p.inn ? `<div class="sz-egrul-row"><span>ИНН:</span> ${escapeHtml(p.inn)}</div>` : ''}
+      ${p.ogrn ? `<div class="sz-egrul-row"><span>ОГРН:</span> ${escapeHtml(p.ogrn)}</div>` : ''}
+      ${p.kpp ? `<div class="sz-egrul-row"><span>КПП:</span> ${escapeHtml(p.kpp)}</div>` : ''}
+      ${p.address ? `<div class="sz-egrul-row"><span>Адрес:</span> ${escapeHtml(p.address)}</div>` : ''}
+      ${p.regDate ? `<div class="sz-egrul-row"><span>Дата рег.:</span> ${escapeHtml(p.regDate)}</div>` : ''}
       <div class="sz-egrul-row"><span>Статус:</span> <strong class="${p.isActive ? 'ok' : 'bad'}">${p.isActive ? 'ДЕЙСТВУЮЩАЯ' : 'ПРЕКРАЩЕНА'}</strong></div>
-      ${!p.isActive && p.reason ? `<div class="sz-egrul-desc">${p.reason} — критическое нарушение, сайт нельзя использовать для коммерческой деятельности.</div>` : ''}
+      ${!p.isActive && p.reason ? `<div class="sz-egrul-desc">${escapeHtml(p.reason)} — критическое нарушение, сайт нельзя использовать для коммерческой деятельности.</div>` : ''}
     </div>`;
   }
 })();
