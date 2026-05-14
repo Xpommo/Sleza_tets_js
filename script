@@ -25,7 +25,6 @@
   // ── Настройки краулера ────────────────────────
   const MAX_PAGES        = 200;  // максимум страниц для скана
   const MAX_DEPTH        = 2;    // глубина обхода если нет sitemap
-  // BATCH_SIZE зарезервирован для будущего батч-режима Sleza; сейчас не используется
   const SLEZA_DELAY_MS   = 1100; // 1 запрос в секунду (лимит API)
   const FETCH_TIMEOUT    = 8000; // таймаут загрузки страницы
   // ──────────────────────────────────────────────
@@ -44,7 +43,7 @@
       /выполня[а-яё]+\s+функци[а-яё]+\s+иностранн[а-яё]+\s+агент/i,
       /включ[её]н[аы]?\s+в\s+(реестр|список|перечень)\s+(иностранн|иноагент)/i,
       /признан[аыо]?\s+(физ[а-яё.\s]*лиц[а-яё]*\s+)?иностранн[а-яё]*\s+агент/i,
-      /смис?\s*,?\s*выполня[а-яё]+\s+функци[а-яё]+\s+иностранн/i,
+      /сми\s*,?\s*выполня[а-яё]+\s+функци[а-яё]+\s+иностранн/i,
     ],
     extremist: [
       /(организаци[яи]|деятельност[ьи])\s+(которой\s+)?запрещен[аы]?\s+(в\s+)?(рф|росси)/i,
@@ -54,9 +53,11 @@
       /(экстремистск|террористич)[а-яё]+\s+(организаци|деятельност|объединени)/i,
     ],
   };
+  // terrorist — подмножество extremist с точки зрения маркировки, используем те же паттерны
+  MARK_RE.terrorist = MARK_RE.extremist;
 
   // Сноска со звёздочкой в конце материала: "* — лица, признанные иностранными агентами"
-  const STAR_FOOTNOTE_RE = /[\*✱⁕＊][\s\-—–:]{0,4}[^.\n\r]{0,400}(иноагент|иностранн[а-яё]*\s+агент|экстремистск|террористич|запрещ[её]н[ао]?\s+в\s+(рф|росси))/i;
+  const STAR_FOOTNOTE_RE = /[\*✱⁕＊][\s\-—–:]{0,4}[^\n\r]{0,200}(иноагент|иностранн[а-яё]*\s+агент|экстремистск|террористич|запрещ[её]н[ао]?\s+в\s+(рф|росси))/i;
 
   function categorizeMarking(m) {
     const x = m.toLowerCase();
@@ -453,6 +454,7 @@
         label: 'Полное наименование (ООО/АО/ИП)',
         patterns: [
           /(?:^|[\s>])(ООО|ОАО|ЗАО|ПАО|АО|НКО|АНО|НП)\s+["«][^"»]{2,80}["»]/,
+          /(?:^|[\s>])(ООО|ОАО|ЗАО|ПАО|АО)\s+[А-ЯЁ][а-яёА-ЯЁ\w\-]{1,40}(?=[\s,.]|$)/,
           /общество\s+с\s+ограниченной\s+ответственностью/i,
           /(публичное|непубличное|открытое|закрытое)\s+акционерное\s+общество/i,
           /индивидуальный\s+предприниматель\s+[А-ЯЁ]/i,
@@ -501,6 +503,10 @@
     if (result.found >= 4) result.status = 'ok';
     else if (result.found >= 2) result.status = 'risk';
     else result.status = 'violation';
+
+    // ИНН/ОГРН — самый критичный реквизит: без него ok → risk
+    const hasInnOgrn = result.items.find(i => i.id === 'inn_ogrn')?.present;
+    if (!hasInnOgrn && result.status === 'ok') result.status = 'risk';
 
     return result;
   }
@@ -1360,27 +1366,34 @@
     if (scanCancelled) return [];
     let origin;
     try { origin = new URL(originUrl).origin; } catch (e) { return []; }
-    const candidates = [
-      '/privacy', '/privacy-policy', '/policy',
-      '/legal/privacy', '/legal/privacy-policy', '/info/privacy',
-      '/about/privacy', '/static/privacy', '/static-pages/privacy',
-      '/policies/privacy', '/privacy.html', '/privacy.shtml',
-      '/personal-data', '/persdata',
+
+    // Две волны: сначала 5 самых частых путей параллельно — если нашли, не идём дальше.
+    // Вторая волна — оставшиеся 9. Это убирает 8 с задержку по 8 с на SPA-сайтах.
+    const wave1 = ['/privacy-policy', '/privacy', '/policy', '/personal-data', '/legal/privacy'];
+    const wave2 = [
+      '/legal/privacy-policy', '/info/privacy', '/about/privacy',
+      '/static/privacy', '/static-pages/privacy', '/policies/privacy',
+      '/privacy.html', '/privacy.shtml', '/persdata',
     ];
-    const results = await Promise.all(candidates.map(p => fetchUrl(origin + p)));
-    if (scanCancelled) return [];
-    const found = results
-      .filter(r => r && r.ok && r.text && r.text.length > 500)
-      .filter(r => {
-        const t = r.text.toLowerCase();
-        // Sanity: страница похожа на политику
-        return t.includes('персональн') || t.includes('privacy') ||
-               t.includes('конфиденц')   || t.includes('обработк');
-      });
-    if (found.length === 0) return [];
-    // Самая длинная страница = наиболее полная политика
-    found.sort((a, b) => b.text.length - a.text.length);
-    return [{ url: found[0].url, text: found[0].text.slice(0, 50000) }];
+
+    function isPolicyPage(r) {
+      if (!r || !r.ok || !r.text || r.text.length < 500) return false;
+      const t = r.text.toLowerCase();
+      return t.includes('персональн') || t.includes('privacy') ||
+             t.includes('конфиденц')   || t.includes('обработк');
+    }
+
+    for (const wave of [wave1, wave2]) {
+      if (scanCancelled) return [];
+      const results = await Promise.all(wave.map(p => fetchUrl(origin + p)));
+      if (scanCancelled) return [];
+      const found = results.filter(isPolicyPage);
+      if (found.length > 0) {
+        found.sort((a, b) => b.text.length - a.text.length);
+        return [{ url: found[0].url, text: found[0].text.slice(0, 50000) }];
+      }
+    }
+    return [];
   }
 
   // ── AI-арбитр для 152-ФЗ: подтверждает пункты, которые локальный чек не нашёл ──
@@ -1586,7 +1599,8 @@
             resolve({ ...parsed, fetched, result152, result149 });
           } catch(e) { resolve({ error: e.message, fetched, result152, result149 }); }
         },
-        onerror() { resolve({ error: 'net', fetched, result152, result149 }); }
+        onerror()   { resolve({ error: 'net',     fetched, result152, result149 }); },
+        ontimeout() { resolve({ error: 'timeout', fetched, result152, result149 }); }
       });
     });
   }
@@ -1679,23 +1693,20 @@
         // источник: ${source === 'sitemap' ? 'sitemap.xml' : source === 'sitemap-index' ? 'sitemap-index' : 'обход страниц'} · максимум: ${MAX_PAGES} страниц
         ${stats ? `<br>// приоритизация: <span style="color:#4ade80">📰 ${stats.highScanned} из ${stats.totalHighFound} контентн.</span> · <span style="color:#94a3b8">🏢 ${stats.mid} корпорат.</span>${stats.low > 0 ? ` · <span style="color:#64748b">📄 ${stats.low} прочих</span>` : ''}${stats.skipped > 0 ? ` · <span style="color:#475569">✗ ${stats.skipped} тех.страниц пропущено</span>` : ''}${stats.yearRange ? `<br>// покрытие архива: <span style="color:#60a5fa">📅 ${stats.yearRange}</span> · ${stats.yearsCovered.length} ${plural(stats.yearsCovered.length, 'год', 'года', 'лет')}` : ''}` : ''}
         ${(() => {
-          const skippedByFilter = pages.filter(p => p.skipped).length;
-          const apiCalledCount = pages.length - skippedByFilter - pages.filter(p => p.error).length;
+          const skippedCount = pages.filter(p => p.skipped).length;
+          const apiCalled = pages.length - skippedCount - pages.filter(p => p.error).length;
           const otherItems = allItems.filter(i => i.category !== 'inoagent' && i.category !== 'extremist' && i.category !== 'terrorist');
-          const debugHint = apiCalledCount === 0
+          const debugHint = apiCalled === 0
             ? `<br>// <span style="color:#f87171">⚠ API Слезы: 0 вызовов — все страницы пропущены предфильтром</span>`
             : allItems.length === 0
-              ? `<br>// <span style="color:#fbbf24">⚠ API Слезы: ${apiCalledCount} вызовов → 0 упоминаний в реестре</span>`
+              ? `<br>// <span style="color:#fbbf24">⚠ API Слезы: ${apiCalled} вызовов → 0 упоминаний в реестре</span>`
               : otherItems.length > 0
                 ? `<br>// <span style="color:#fbbf24">API нашёл ${allItems.length} упоминаний (${otherItems.length} не классифицированы)</span>`
                 : '';
-          return debugHint;
-        })()}
-        ${(() => {
-          const skippedByFilter = pages.filter(p => p.skipped).length;
-          const apiCalled = pages.length - skippedByFilter - pages.filter(p => p.error).length;
-          if (skippedByFilter === 0) return '';
-          return `<br>// предфильтр: <span style="color:#60a5fa">🔍 ${apiCalled} API-запросов</span> · <span style="color:#4ade80">⚡ ${skippedByFilter} страниц пропущено без API</span> · экономия ${Math.round(skippedByFilter / pages.length * 100)}%`;
+          const filterHint = skippedCount > 0
+            ? `<br>// предфильтр: <span style="color:#60a5fa">🔍 ${apiCalled} API-запросов</span> · <span style="color:#4ade80">⚡ ${skippedCount} страниц пропущено без API</span> · экономия ${Math.round(skippedCount / pages.length * 100)}%`
+            : '';
+          return debugHint + filterHint;
         })()}
       </div>
       ` : ''}
