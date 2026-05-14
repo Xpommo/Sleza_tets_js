@@ -1482,6 +1482,19 @@
         ${stats ? `<br>// приоритизация: <span style="color:#4ade80">📰 ${stats.highScanned} из ${stats.totalHighFound} контентн.</span> · <span style="color:#94a3b8">🏢 ${stats.mid} корпорат.</span>${stats.low > 0 ? ` · <span style="color:#64748b">📄 ${stats.low} прочих</span>` : ''}${stats.skipped > 0 ? ` · <span style="color:#475569">✗ ${stats.skipped} тех.страниц пропущено</span>` : ''}` : ''}
         ${(() => {
           const skippedByFilter = pages.filter(p => p.skipped).length;
+          const apiCalledCount = pages.length - skippedByFilter - pages.filter(p => p.error).length;
+          const otherItems = allItems.filter(i => i.category !== 'inoagent' && i.category !== 'extremist' && i.category !== 'terrorist');
+          const debugHint = apiCalledCount === 0
+            ? `<br>// <span style="color:#f87171">⚠ API Слезы: 0 вызовов — все страницы пропущены предфильтром</span>`
+            : allItems.length === 0
+              ? `<br>// <span style="color:#fbbf24">⚠ API Слезы: ${apiCalledCount} вызовов → 0 упоминаний в реестре</span>`
+              : otherItems.length > 0
+                ? `<br>// <span style="color:#fbbf24">API нашёл ${allItems.length} упоминаний (${otherItems.length} не классифицированы)</span>`
+                : '';
+          return debugHint;
+        })()}
+        ${(() => {
+          const skippedByFilter = pages.filter(p => p.skipped).length;
           const apiCalled = pages.length - skippedByFilter - pages.filter(p => p.error).length;
           if (skippedByFilter === 0) return '';
           return `<br>// предфильтр: <span style="color:#60a5fa">🔍 ${apiCalled} API-запросов</span> · <span style="color:#4ade80">⚡ ${skippedByFilter} страниц пропущено без API</span> · экономия ${Math.round(skippedByFilter / pages.length * 100)}%`;
