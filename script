@@ -425,6 +425,86 @@
     return result;
   }
 
+  // ── Чек-лист 149-ФЗ ст.10 — информация о владельце сайта ──
+  // На сайте организации должны быть указаны:
+  // 1. ИНН или ОГРН (для идентификации владельца)
+  // 2. Полное наименование (ООО/АО/ИП) или ФИО ИП
+  // 3. Адрес юр. лица или ИП
+  // 4. Email для связи
+  // 5. Контактный телефон
+  function check149FZ(fullText) {
+    if (!fullText || fullText.length < 50) {
+      return { found: 0, total: 5, items: [], status: 'unknown' };
+    }
+
+    // Лидирующая "граница слова" для кириллицы: либо начало строки, либо разделитель.
+    // \b в JS работает только с латиницей/цифрами, поэтому \bИНН не цепляется к "ИНН 123".
+    const checks = [
+      {
+        id: 'inn_ogrn',
+        label: 'ИНН или ОГРН организации',
+        patterns: [
+          /(?:^|[\s>,.;:])ИНН[\s:№.]*[0-9]{10,12}(?:\D|$)/i,
+          /(?:^|[\s>,.;:])ОГРН(?:ИП)?[\s:№.]*[0-9]{13,15}(?:\D|$)/i,
+        ],
+      },
+      {
+        id: 'name',
+        label: 'Полное наименование (ООО/АО/ИП)',
+        patterns: [
+          /(?:^|[\s>])(ООО|ОАО|ЗАО|ПАО|АО|НКО|АНО|НП)\s+["«][^"»]{2,80}["»]/,
+          /общество\s+с\s+ограниченной\s+ответственностью/i,
+          /(публичное|непубличное|открытое|закрытое)\s+акционерное\s+общество/i,
+          /индивидуальный\s+предприниматель\s+[А-ЯЁ]/i,
+          /(?:^|[\s>])ИП\s+[А-ЯЁ][а-яё]+\s+[А-ЯЁ]/,
+        ],
+      },
+      {
+        id: 'email',
+        label: 'Email для связи',
+        patterns: [
+          /[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/i,
+        ],
+      },
+      {
+        id: 'phone',
+        label: 'Контактный телефон',
+        patterns: [
+          /(?:\+7|(?:^|\D)8)[\s\(\-]*\d{3}[\s\)\-]*\d{3}[\s\-]*\d{2}[\s\-]*\d{2}(?:\D|$)/,
+        ],
+      },
+      {
+        id: 'address',
+        label: 'Юридический или фактический адрес',
+        patterns: [
+          // Почтовый индекс + город / регион
+          /(?:^|\D)\d{6}[,\s]+(г\.|город|респ\.|область|край|москва|санкт-петербург)/i,
+          // Москва/Питер + улица/проспект
+          /(г\.\s*Москва|г\.\s*Санкт-Петербург|москва|санкт-петербург)[,\s]+(ул\.|улица|пр\.|проспект|пер\.|переулок|наб\.|набережная|пл\.|площадь|шоссе|бульвар|проезд|тупик)/i,
+          // улица + дом
+          /(ул\.|улица|пр\.|проспект|пер\.|переулок|наб\.|набережная)\s+[А-ЯЁ][а-яё]+[,\s\.]+(д\.|дом)\s*\d+/i,
+          // явная подпись "юридический адрес: ..."
+          /юридический\s+адрес[\s:]+[А-ЯЁ\d]/i,
+          /почтовый\s+адрес[\s:]+[А-ЯЁ\d]/i,
+          /адрес\s+(организации|компании|юр[. ]+лица)/i,
+        ],
+      },
+    ];
+
+    const result = { items: [], found: 0, total: checks.length, status: 'unknown' };
+    for (const c of checks) {
+      const present = c.patterns.some(p => p.test(fullText));
+      result.items.push({ id: c.id, label: c.label, present });
+      if (present) result.found++;
+    }
+
+    if (result.found >= 4) result.status = 'ok';
+    else if (result.found >= 2) result.status = 'risk';
+    else result.status = 'violation';
+
+    return result;
+  }
+
   function fetchUrl(url) {
     return new Promise(resolve => {
       if (scanCancelled) return resolve({ url, ok: false, html: '', text: '' });
@@ -1020,7 +1100,7 @@
     const egrul = { checked: true, ids, result: egrulResult };
 
     showProgress({ phase: 'ai', current: 1, total: 1 });
-    const aiData = await runAIAnalysis(c, egrul);
+    const aiData = await runAIAnalysis(c, egrul, fullText);
 
     renderResults({
       mode: 'single',
@@ -1181,7 +1261,7 @@
     }
     const egrul = { checked: true, ids, result: egrulResult };
 
-    const aiData = await runAIAnalysis(c, egrul);
+    const aiData = await runAIAnalysis(c, egrul, allPagesText);
 
     renderResults({ mode: 'full', origin, hostname, pages, aiData, source: urlList.source, egrul, stats, slezaError: firstSlezaError });
   }
@@ -1294,7 +1374,7 @@
     });
   }
 
-  async function runAIAnalysis(c, egrul) {
+  async function runAIAnalysis(c, egrul, siteText) {
     // Загружаем подстраницы политики/оферты для AI
     const allLinks = [...c.policyLinks, ...c.offerLinks, ...c.returnLinks, ...c.aboutLinks];
     const fetched = {};
@@ -1379,6 +1459,21 @@
       msg += `\n═══ 152-ФЗ: ПОЛИТИКА НЕ НАЙДЕНА ═══\nЭто явное нарушение — на сайте должна быть политика конфиденциальности.\n═══════════════════════════════════════════\n`;
     }
 
+    // ── Локальный чек-лист 149-ФЗ ст.10 (5 пунктов: ИНН/ОГРН, название, адрес, email, телефон) ──
+    // Берём комбинированный текст: страницы сайта + страницы политики/о компании/контактов.
+    const aboutText = (fetched.about || []).map(p => p.text).join('\n');
+    const contactText = (fetched.policy || []).map(p => p.text).join('\n') + '\n' + aboutText;
+    const text149 = (siteText || '') + '\n' + contactText;
+    const result149 = check149FZ(text149);
+    msg += `\n═══ ЛОКАЛЬНЫЙ ЧЕК-ЛИСТ 149-ФЗ ст.10 ═══\n`;
+    msg += `Найдено пунктов: ${result149.found} из ${result149.total}\n`;
+    result149.items.forEach(item => {
+      msg += `${item.present ? '✓' : '✗'} ${item.label}\n`;
+    });
+    msg += `Локальный вывод: ${result149.status === 'ok' ? 'реквизиты на месте' : result149.status === 'risk' ? 'часть реквизитов отсутствует' : 'критические пробелы по реквизитам'}\n`;
+    msg += `→ Используй этот чек-лист + результат ЕГРЮЛ выше. Не пересчитывай заново.\n`;
+    msg += `═══════════════════════════════════════════\n`;
+
     return new Promise(resolve => {
       GM_xmlhttpRequest({
         method: 'POST',
@@ -1401,10 +1496,10 @@
             const m = txt.match(/\{[\s\S]*\}/);
             if (!m) throw new Error('parse');
             const parsed = JSON.parse(m[0]);
-            resolve({ ...parsed, fetched, result152 });
-          } catch(e) { resolve({ error: e.message, fetched, result152 }); }
+            resolve({ ...parsed, fetched, result152, result149 });
+          } catch(e) { resolve({ error: e.message, fetched, result152, result149 }); }
         },
-        onerror() { resolve({ error: 'net', fetched, result152 }); }
+        onerror() { resolve({ error: 'net', fetched, result152, result149 }); }
       });
     });
   }
@@ -1543,7 +1638,7 @@
       <div class="sz-checks">
         ${renderSlezaCheck(inoItems, 'Маркировка иноагентов', 'ФЗ №121, №255-ФЗ', '40 000 — 500 000 руб.', pages, 'inoagent')}
         ${renderSlezaCheck(extItems, 'Маркировка экстремистов / террористов', 'ст.13.15 КоАП, ФЗ №114', 'до 500 000 руб.', pages, 'extremist')}
-        ${aiChecks.map((ch, i) => renderAICheck(ch, i, egrul, aiData?.result152)).join('')}
+        ${aiChecks.map((ch, i) => renderAICheck(ch, i, egrul, aiData?.result152, aiData?.result149)).join('')}
       </div>
 
       <div class="sz-cta">
@@ -1684,7 +1779,7 @@
     return many;
   }
 
-  function renderAICheck(ch, i, egrul, result152) {
+  function renderAICheck(ch, i, egrul, result152, result149) {
     const st = ST[ch.status] || ST.unknown;
     const showLoc = ch.status !== 'ok' && ch.status !== 'unknown' && ch.found_text && !ch.found_text.toLowerCase().includes('отсутств');
     const showQuote = ch.found_text && !ch.found_text.toLowerCase().includes('отсутств') && ch.status !== 'ok';
@@ -1701,7 +1796,13 @@
       block152 = render152Block(result152);
     }
 
-    // Если есть локальный чек 152-ФЗ — переопределяем статус карточки
+    // Блок чек-листа 149-ФЗ
+    let block149 = '';
+    if (result149 && (ch.law_code || '').includes('149-ФЗ')) {
+      block149 = render149Block(result149);
+    }
+
+    // Если есть локальный чек — переопределяем статус карточки
     let effectiveStatus = ch.status;
     let effectiveLabel = ST[ch.status]?.label || 'НЕТ ДАННЫХ';
     let effectiveCls = ST[ch.status]?.cls || 'unknown';
@@ -1710,13 +1811,22 @@
       else if (result152.status === 'risk') { effectiveStatus = 'risk'; effectiveLabel = ST.risk.label; effectiveCls = ST.risk.cls; }
       else if (result152.status === 'violation' || result152.status === 'no_policy') { effectiveStatus = 'violation'; effectiveLabel = ST.violation.label; effectiveCls = ST.violation.cls; }
     }
+    if (result149 && (ch.law_code || '').includes('149-ФЗ')) {
+      // ЕГРЮЛ может ужесточить статус: организация прекращена → нарушение независимо от чек-листа
+      const egrulInactive = egrul?.result?.parsed && egrul.result.parsed.isActive === false;
+      let local = result149.status;
+      if (egrulInactive) local = 'violation';
+      if (local === 'ok') { effectiveStatus = 'ok'; effectiveLabel = ST.ok.label; effectiveCls = ST.ok.cls; }
+      else if (local === 'risk') { effectiveStatus = 'risk'; effectiveLabel = ST.risk.label; effectiveCls = ST.risk.cls; }
+      else if (local === 'violation') { effectiveStatus = 'violation'; effectiveLabel = ST.violation.label; effectiveCls = ST.violation.cls; }
+    }
 
     return `
       <div class="sz-check ${effectiveCls}">
         <div class="sz-ct">
           <div>
             <div class="sz-ln">${escapeHtml(ch.law)}</div>
-            <div class="sz-lc">${escapeHtml(ch.law_code)}${egrulBlock ? ' · ЕГРЮЛ' : ''}${block152 ? ' · чек-лист' : ''}</div>
+            <div class="sz-lc">${escapeHtml(ch.law_code)}${egrulBlock ? ' · ЕГРЮЛ' : ''}${block152 || block149 ? ' · чек-лист' : ''}</div>
           </div>
           <div class="sz-pill ${effectiveCls}">${effectiveLabel}</div>
         </div>
@@ -1726,6 +1836,7 @@
             <div class="sz-fv iss">${escapeHtml(ch.issue || '—')}</div>
             ${egrulBlock}
             ${block152}
+            ${block149}
             ${showLoc ? `<button class="sz-loc-btn" data-check-idx="${i}"><span class="sz-loc-icon">📍</span><span class="sz-loc-label">${escapeHtml(ch.location || 'на странице')}</span></button>` : ''}
             ${showQuote ? `<div class="sz-quote">"${escapeHtml(ch.found_text)}"</div>` : ''}
           </div>
@@ -1777,6 +1888,34 @@
     } else {
       desc = 'Политика содержит все обязательные пункты по ст. 18.1 152-ФЗ.';
     }
+
+    return `<div class="sz-egrul-block ${cls}">
+      <div class="sz-egrul-title">${icon} ${title}</div>
+      <div class="sz-152-list">${items}</div>
+      <div class="sz-egrul-desc">${desc}</div>
+    </div>`;
+  }
+
+  function render149Block(r) {
+    const cls = r.status === 'ok' ? 'good' : r.status === 'risk' ? 'warn' : 'bad';
+    const icon = r.status === 'ok' ? '✓' : r.status === 'risk' ? '⚠' : '✗';
+    const title = r.status === 'ok' ? `Реквизиты полные (${r.found} из ${r.total})` :
+                  r.status === 'risk' ? `Реквизиты неполные (${r.found} из ${r.total})` :
+                  `Критические пробелы (${r.found} из ${r.total})`;
+
+    const items = r.items.map(item => {
+      const iconChar = item.present ? '✓' : '✗';
+      const iconCls = item.present ? 'ok' : 'miss';
+      return `<div class="sz-152-row">
+        <span class="sz-152-icon ${iconCls}">${iconChar}</span>
+        <span class="sz-152-label ${item.present ? '' : 'miss'}">${escapeHtml(item.label)}</span>
+      </div>`;
+    }).join('');
+
+    const missing = r.items.filter(i => !i.present);
+    const desc = missing.length > 0
+      ? `Отсутствует на сайте: ${escapeHtml(missing.map(i => i.label.toLowerCase()).join('; '))}.`
+      : 'Все обязательные реквизиты владельца указаны на сайте.';
 
     return `<div class="sz-egrul-block ${cls}">
       <div class="sz-egrul-title">${icon} ${title}</div>
