@@ -23,7 +23,7 @@
   // ──────────────────────────────────────────────
 
   // ── Настройки краулера ────────────────────────
-  const MAX_PAGES        = 100;  // максимум страниц для скана (было 30)
+  const MAX_PAGES        = 200;  // максимум страниц для скана
   const MAX_DEPTH        = 2;    // глубина обхода если нет sitemap
   // BATCH_SIZE зарезервирован для будущего батч-режима Sleza; сейчас не используется
   const SLEZA_DELAY_MS   = 1100; // 1 запрос в секунду (лимит API)
@@ -538,32 +538,95 @@
     const urls = [
       origin + '/sitemap.xml',
       origin + '/sitemap_index.xml',
+      origin + '/sitemap-index.xml',
       origin + '/sitemap1.xml',
+      origin + '/sitemap-news.xml',
+      origin + '/sitemap-posts.xml',
+      origin + '/sitemap-articles.xml',
+      origin + '/news-sitemap.xml',
+      origin + '/post-sitemap.xml',
+      origin + '/sitemap/sitemap.xml',
+      origin + '/sitemaps/sitemap.xml',
     ];
     for (const u of urls) {
       const r = await fetchUrl(u);
       if (r.ok && r.html.includes('<loc>')) {
         const matches = [...r.html.matchAll(/<loc>([^<]+)<\/loc>/g)].map(m => m[1].trim());
         const filtered = matches.filter(url => url.startsWith(origin) && isHtmlUrl(url));
-        if (filtered.length > 0) {
-          // Если это sitemap-индекс — рекурсивно загружаем дочерние
-          const subSitemaps = matches.filter(u => u.endsWith('.xml') && u !== origin);
-          if (subSitemaps.length > 0 && filtered.length < 5) {
-            const subUrls = [];
-            for (const sm of subSitemaps.slice(0, 3)) {
-              const sr = await fetchUrl(sm);
-              if (sr.ok) {
-                const sm2 = [...sr.html.matchAll(/<loc>([^<]+)<\/loc>/g)].map(m => m[1].trim());
-                subUrls.push(...sm2.filter(url => url.startsWith(origin) && isHtmlUrl(url)));
-              }
+        const subSitemaps = matches.filter(m => m.endsWith('.xml') && m !== u);
+
+        // sitemap-index: ходим по дочерним и собираем URL
+        if (subSitemaps.length > 0) {
+          const subUrls = [];
+          // Берём до 20 sub-sitemaps (часто разбит по годам/категориям — нужны все для покрытия архива)
+          for (const sm of subSitemaps.slice(0, 20)) {
+            if (scanCancelled) break;
+            const sr = await fetchUrl(sm);
+            if (sr.ok) {
+              const sm2 = [...sr.html.matchAll(/<loc>([^<]+)<\/loc>/g)].map(m => m[1].trim());
+              subUrls.push(...sm2.filter(url => url.startsWith(origin) && isHtmlUrl(url)));
             }
+          }
+          if (subUrls.length > 0) {
             return { source: 'sitemap-index', urls: [...new Set([...filtered, ...subUrls])] };
           }
+        }
+        if (filtered.length > 0) {
           return { source: 'sitemap', urls: [...new Set(filtered)] };
         }
       }
     }
     return null;
+  }
+
+  // Извлечь год публикации из URL: ловит /2019/, /2021-05-15/, /2020/05/, ?date=2018-...
+  function extractYearFromUrl(url) {
+    const m = url.match(/(?:^|[\/=_\-?&])(20[0-3]\d)(?:[\/=_\-?&]|$)/);
+    if (m) {
+      const y = parseInt(m[1], 10);
+      if (y >= 2010 && y <= 2030) return y;
+    }
+    return null;
+  }
+
+  // Stride-сэмплинг: равномерная выборка N элементов из массива
+  function strideSample(arr, n) {
+    if (arr.length <= n) return [...arr];
+    const step = arr.length / n;
+    const result = [];
+    for (let i = 0; i < n; i++) result.push(arr[Math.floor(i * step)]);
+    return result;
+  }
+
+  // Year-bucket сэмплинг: распределяет budget равномерно по годам.
+  // Если <3 различных года определилось — fallback на stride-сэмплинг.
+  function sampleByYear(urls, budget) {
+    if (urls.length <= budget) return [...urls];
+    const buckets = new Map();
+    for (const u of urls) {
+      const y = extractYearFromUrl(u);
+      const key = y || 'unknown';
+      if (!buckets.has(key)) buckets.set(key, []);
+      buckets.get(key).push(u);
+    }
+    const years = [...buckets.keys()].filter(k => typeof k === 'number').sort();
+    if (years.length < 3) return strideSample(urls, budget);
+
+    // Резервируем 15% бюджета на URL без года (главная, секции, статичные)
+    const noYear = buckets.get('unknown') || [];
+    const noYearShare = Math.min(noYear.length, Math.floor(budget * 0.15));
+    const yearBudget = budget - noYearShare;
+    const perYear = Math.ceil(yearBudget / years.length);
+
+    const result = [];
+    for (const y of years) {
+      const bucket = buckets.get(y);
+      // Внутри года тоже распределяем равномерно (а не первые N — там вверху обычно свежее)
+      result.push(...strideSample(bucket, Math.min(perYear, bucket.length)));
+    }
+    // URL без года — страйдом
+    result.push(...strideSample(noYear, noYearShare));
+    return result.slice(0, budget);
   }
 
   function isHtmlUrl(url) {
@@ -1132,11 +1195,9 @@
     if (scanCancelled) return;
 
     let urls = urlList.urls;
+    const totalDiscovered = urls.length;
 
-    // ── Стратегия отбора: контент важнее всего ──
-    // 1. Берём все HIGH (контентные) страницы
-    // 2. Главная + 2-3 MED страницы (для AI анализа политики/оферты)
-    // 3. LOW страницы — только если осталось место
+    // ── Стратегия отбора: HIGH-контент с покрытием по годам ──
     const scored = urls
       .map(u => ({ url: u, score: scoreUrl(u) }))
       .filter(x => x.score >= 0); // отбрасываем технические страницы
@@ -1145,28 +1206,39 @@
     const medPages  = scored.filter(x => x.score === 5 || x.score === 7).map(x => x.url);
     const lowPages  = scored.filter(x => x.score === 3).map(x => x.url);
 
-    // Сначала HIGH (контент)
-    let prioritized = [...highPages];
-    // Добавляем MED для AI-анализа (но не больше 5 на корпоративные)
-    const medSlots = Math.min(medPages.length, Math.min(5, MAX_PAGES - prioritized.length));
-    prioritized = [...prioritized, ...medPages.slice(0, medSlots)];
-    // LOW — только если есть свободные слоты
-    if (prioritized.length < MAX_PAGES) {
-      prioritized = [...prioritized, ...lowPages.slice(0, MAX_PAGES - prioritized.length)];
-    }
+    // Бюджет: MED ≤10 (корпоративные нужны для 152/149/оферты), остальное под HIGH, остаток LOW.
+    const medBudget = Math.min(medPages.length, 10);
+    const lowBudget = Math.min(lowPages.length, Math.max(0, Math.min(20, MAX_PAGES - highPages.length - medBudget)));
+    const highBudget = Math.max(0, MAX_PAGES - medBudget - lowBudget);
+
+    // HIGH-страницы сэмплируем по годам — гарантирует покрытие архива до и после 2022
+    const highSampled = sampleByYear(highPages, highBudget);
+    const medSampled  = medPages.slice(0, medBudget); // корпоративные не сэмплируем по годам
+    const lowSampled  = strideSample(lowPages, lowBudget);
 
     // Главная всегда первая
-    const withoutCurrent = prioritized.filter(u => u !== location.href);
+    const all = [...highSampled, ...medSampled, ...lowSampled];
+    const withoutCurrent = all.filter(u => u !== location.href);
     urls = [location.href, ...withoutCurrent].slice(0, MAX_PAGES);
 
+    // Подсчёт лет в финальной выборке — для статистики в UI
+    const yearsSet = new Set();
+    for (const u of urls) {
+      const y = extractYearFromUrl(u);
+      if (y) yearsSet.add(y);
+    }
+
     // Статистика по типам
+    const yearsSorted = [...yearsSet].sort();
     const stats = {
       high: highPages.length,
-      highScanned: Math.min(highPages.length, MAX_PAGES),
-      mid: medSlots,
-      low: Math.max(0, urls.length - highPages.length - medSlots - 1),
-      skipped: urlList.urls.length - scored.length,
-      totalHighFound: highPages.length
+      highScanned: highSampled.length,
+      mid: medBudget,
+      low: lowSampled.length,
+      skipped: totalDiscovered - scored.length,
+      totalHighFound: highPages.length,
+      yearsCovered: yearsSorted,
+      yearRange: yearsSorted.length > 0 ? `${yearsSorted[0]}–${yearsSorted[yearsSorted.length-1]}` : null,
     };
 
     // 2. Сканируем каждую страницу через API Слезы
@@ -1590,7 +1662,7 @@
       </div>
       <div style="font-family:'Courier New',monospace;font-size:10px;color:#64748b;margin-bottom:14px;text-align:center;line-height:1.7">
         // источник: ${source === 'sitemap' ? 'sitemap.xml' : source === 'sitemap-index' ? 'sitemap-index' : 'обход страниц'} · максимум: ${MAX_PAGES} страниц
-        ${stats ? `<br>// приоритизация: <span style="color:#4ade80">📰 ${stats.highScanned} из ${stats.totalHighFound} контентн.</span> · <span style="color:#94a3b8">🏢 ${stats.mid} корпорат.</span>${stats.low > 0 ? ` · <span style="color:#64748b">📄 ${stats.low} прочих</span>` : ''}${stats.skipped > 0 ? ` · <span style="color:#475569">✗ ${stats.skipped} тех.страниц пропущено</span>` : ''}` : ''}
+        ${stats ? `<br>// приоритизация: <span style="color:#4ade80">📰 ${stats.highScanned} из ${stats.totalHighFound} контентн.</span> · <span style="color:#94a3b8">🏢 ${stats.mid} корпорат.</span>${stats.low > 0 ? ` · <span style="color:#64748b">📄 ${stats.low} прочих</span>` : ''}${stats.skipped > 0 ? ` · <span style="color:#475569">✗ ${stats.skipped} тех.страниц пропущено</span>` : ''}${stats.yearRange ? `<br>// покрытие архива: <span style="color:#60a5fa">📅 ${stats.yearRange}</span> · ${stats.yearsCovered.length} ${plural(stats.yearsCovered.length, 'год', 'года', 'лет')}` : ''}` : ''}
         ${(() => {
           const skippedByFilter = pages.filter(p => p.skipped).length;
           const apiCalledCount = pages.length - skippedByFilter - pages.filter(p => p.error).length;
