@@ -34,11 +34,29 @@
     return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
   }
 
-  const MARK_PATTERNS = [
-    'иностранн','иноагент','экстремист','террорист',
-    'запрещ','признан','нежелательн',
-    'выполняющ функции','включ','имеющий статус'
-  ];
+  // Точные формулировки маркировки по категориям.
+  // Старый MARK_PATTERNS (substring includes) давал ложные срабатывания
+  // на "иностранных дел", "включая", "признан лучшим" → нарушения скрывались.
+  const MARK_RE = {
+    inoagent: [
+      /иностранн[а-яё]*\s+агент/i,
+      /иноагент/i,
+      /выполня[а-яё]+\s+функци[а-яё]+\s+иностранн[а-яё]+\s+агент/i,
+      /включ[её]н[аы]?\s+в\s+(реестр|список|перечень)\s+(иностранн|иноагент)/i,
+      /признан[аыо]?\s+(физ[а-яё.\s]*лиц[а-яё]*\s+)?иностранн[а-яё]*\s+агент/i,
+      /смис?\s*,?\s*выполня[а-яё]+\s+функци[а-яё]+\s+иностранн/i,
+    ],
+    extremist: [
+      /(организаци[яи]|деятельност[ьи])\s+(которой\s+)?запрещен[аы]?\s+(в\s+)?(рф|росси)/i,
+      /запрещ[её]нн?[ао]?\s+в\s+(рф|росси)/i,
+      /признан[аыо]?\s+(экстремистск|террористич)/i,
+      /включ[её]н[аы]?\s+в\s+(перечень|список|реестр)\s+(террористич|экстремистск)/i,
+      /(экстремистск|террористич)[а-яё]+\s+(организаци|деятельност|объединени)/i,
+    ],
+  };
+
+  // Сноска со звёздочкой в конце материала: "* — лица, признанные иностранными агентами"
+  const STAR_FOOTNOTE_RE = /[\*✱⁕＊][\s\-—–:]{0,4}[^.\n\r]{0,400}(иноагент|иностранн[а-яё]*\s+агент|экстремистск|террористич|запрещ[её]н[ао]?\s+в\s+(рф|росси))/i;
 
   function categorizeMarking(m) {
     const x = m.toLowerCase();
@@ -49,6 +67,8 @@
     return 'other';
   }
 
+  function escapeRegex(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+
   function parseSlezaItem(item) {
     const match = item.match(/^(.+?)\s*\((.+)\)\s*💧?\s*$/);
     if (!match) return { name: item.trim(), marking: '', category: 'other' };
@@ -57,19 +77,63 @@
     return { name, marking, category: categorizeMarking(marking) };
   }
 
-  function checkMarkingNearby(text, name) {
+  // Проверка маркировки конкретного упоминания.
+  // 1) Локальное окно ±200/+400 вокруг КАЖДОГО вхождения имени (не только первого).
+  //    Если в окне найдена формулировка из MARK_RE[category] — промаркировано.
+  // 2) Звёздочка после имени + сноска в любом месте текста с ключевыми словами.
+  // 3) Имя + маркировка в "хвосте" (последние 3000 симв.) — для дисклеймера в конце.
+  function checkMarkingNearby(text, name, category) {
+    if (!text || !name) return { found: false };
     const lower = text.toLowerCase();
-    const idx = lower.indexOf(name.toLowerCase());
+    const nameLow = name.toLowerCase();
+    const idx = lower.indexOf(nameLow);
     if (idx === -1) return { found: false };
-    const start = Math.max(0, idx - 100);
-    const end = Math.min(text.length, idx + name.length + 250);
-    const context = text.slice(start, end);
-    const cl = context.toLowerCase();
-    return {
-      found: true,
-      hasMarking: MARK_PATTERNS.some(p => cl.includes(p)),
-      context
-    };
+
+    const patterns = MARK_RE[category] || [...MARK_RE.inoagent, ...MARK_RE.extremist];
+
+    // Собираем все позиции имени (учитываем повторные упоминания)
+    const positions = [];
+    let p = 0;
+    while ((p = lower.indexOf(nameLow, p)) !== -1 && positions.length < 20) {
+      positions.push(p);
+      p += nameLow.length;
+    }
+
+    let firstContext = '';
+
+    // (1) Локальное окно ±200/+400 для каждого вхождения
+    for (const pos of positions) {
+      const start = Math.max(0, pos - 200);
+      const end = Math.min(text.length, pos + name.length + 400);
+      const window = text.slice(start, end);
+      if (!firstContext) firstContext = window;
+      if (patterns.some(re => re.test(window))) {
+        return { found: true, hasMarking: true, via: 'context', context: window };
+      }
+    }
+
+    // (2) Звёздочка после имени + сноска
+    const starAfter = new RegExp(escapeRegex(name) + '\\s{0,3}[\\*✱⁕＊]+', 'i');
+    if (starAfter.test(text) && STAR_FOOTNOTE_RE.test(text)) {
+      return { found: true, hasMarking: true, via: 'asterisk', context: firstContext };
+    }
+
+    // (3) Хвост: имя + маркировка в последних 3000 симв., в окне ±250 друг от друга
+    const tailStart = Math.max(0, text.length - 3000);
+    const tail = text.slice(tailStart);
+    const tailLow = tail.toLowerCase();
+    let tp = 0;
+    while ((tp = tailLow.indexOf(nameLow, tp)) !== -1) {
+      const ws = Math.max(0, tp - 150);
+      const we = Math.min(tail.length, tp + name.length + 250);
+      const w = tail.slice(ws, we);
+      if (patterns.some(re => re.test(w))) {
+        return { found: true, hasMarking: true, via: 'tail', context: w };
+      }
+      tp += nameLow.length;
+    }
+
+    return { found: true, hasMarking: false, via: null, context: firstContext };
   }
 
   // ── Запросы ───────────────────────────────────
@@ -201,7 +265,7 @@
       /(сообщил[аи]?|написал[аи]?|заявил[аи]?|по\s+данным|по\s+мнению|рассказал[аи]?|подчеркнул[аи]?)\s+[А-ЯЁ]/i,
       // Известные форматы маркировки (если уже промаркировано — тоже кандидат)
       /\(иностранн[ыо]м?\s+агент/i,
-      /(признан[аы]?\s+иностранн[ыо]м?\s+агент|запрещ[её]н[ао]?\s+в\s+(?:РФ|России))/i
+      /(признан[аыо]?\s+иностранн[ыо]м?\s+агент|запрещ[её]н[ао]?\s+в\s+(?:РФ|России))/i
     ];
 
     return patterns.some(p => p.test(text));
@@ -931,7 +995,7 @@
 
     const slezaResult = await checkWithSleza(fullText);
     const items = (slezaResult.items || []).map(parseSlezaItem);
-    const checked = items.map(item => ({ ...item, ...checkMarkingNearby(fullText, item.name), pageUrl: location.href }));
+    const checked = items.map(item => ({ ...item, ...checkMarkingNearby(fullText, item.name, item.category), pageUrl: location.href }));
 
     // ЕГРЮЛ-проверка реквизитов
     showProgress({ phase: 'sleza', current: 1, total: 1, url: 'Проверка ЕГРЮЛ...' });
@@ -1062,7 +1126,7 @@
 
       const slezaResult = await checkWithSleza(pageData.text);
       const items = (slezaResult.items || []).map(parseSlezaItem);
-      const checked = items.map(item => ({ ...item, ...checkMarkingNearby(pageData.text, item.name), pageUrl: url }));
+      const checked = items.map(item => ({ ...item, ...checkMarkingNearby(pageData.text, item.name, item.category), pageUrl: url }));
 
       const unmarkedCount = checked.filter(x => !x.hasMarking).length;
       totalFound += checked.length;
