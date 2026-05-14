@@ -1528,6 +1528,7 @@
         <span style="color:#94a3b8">${
           slezaError === 'no_key' ? 'SLEZA_KEY не заполнен — откройте скрипт в Tampermonkey и впишите ключ в строке 22.' :
           /^http_(401|403)/.test(slezaError) ? 'Неверный SLEZA_KEY — проверьте API-ключ в настройках скрипта (строка ~22).' :
+          /^http_422/.test(slezaError) ? 'Подписка на sleza.media неактивна — войдите в аккаунт и активируйте подписку.' :
           /^http_/.test(slezaError) ? 'API вернул ошибку. Проверьте статус sleza.media.' :
           slezaError === 'timeout' ? 'API не ответил за 10 сек. Возможно перегрузка — попробуйте позже.' :
           slezaError === 'net' ? 'Сетевая ошибка при обращении к sleza.media.' :
