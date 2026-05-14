@@ -142,6 +142,10 @@
   function checkWithSleza(text) {
     return new Promise(resolve => {
       if (scanCancelled) return resolve({ found: 0, items: [], errors: 'cancelled' });
+      if (!SLEZA_KEY || SLEZA_KEY === 'YOUR_SLEZA_API_KEY_HERE') {
+        try { console.warn('[Слеза] SLEZA_KEY не заполнен — проверка иноагентов/экстремистов недоступна'); } catch(_) {}
+        return resolve({ found: 0, items: [], errors: 'no_key' });
+      }
       GM_xmlhttpRequest({
         method: 'POST',
         url: 'https://sleza.media/api/parse',
@@ -150,8 +154,17 @@
         data: JSON.stringify({ text }),
         onload(r) {
           try {
-            resolve(JSON.parse(r.responseText));
-          } catch(e) { resolve({ found: 0, items: [], errors: 'parse' }); }
+            const parsed = JSON.parse(r.responseText);
+            // Лог в консоль — чтобы было видно в DevTools что вернул API
+            try { console.log('[Слеза] API response', r.status, parsed); } catch(_) {}
+            if (r.status !== 200) {
+              return resolve({ found: 0, items: [], errors: 'http_' + r.status, raw: parsed });
+            }
+            resolve(parsed);
+          } catch(e) {
+            try { console.warn('[Слеза] API parse fail', r.status, r.responseText?.slice(0, 200)); } catch(_) {}
+            resolve({ found: 0, items: [], errors: 'parse_http_' + r.status });
+          }
         },
         onerror() { resolve({ found: 0, items: [], errors: 'net' }); },
         ontimeout() { resolve({ found: 0, items: [], errors: 'timeout' }); }
@@ -1015,7 +1028,8 @@
       hostname: location.hostname,
       pages: [{ url: location.href, title: c.title, items: checked, isCurrent: true }],
       aiData,
-      egrul
+      egrul,
+      slezaError: slezaResult.errors || null,
     });
   }
 
@@ -1081,6 +1095,7 @@
     let totalFound = 0;
     let skippedByFilter = 0; // счётчик пропущенных предфильтром
     let allPagesRawText = ''; // накапливаем хвосты страниц для поиска ИНН/ОГРН в подвалах
+    let firstSlezaError = null; // первая ошибка API Слезы (для диагностики)
 
     for (let i = 0; i < urls.length; i++) {
       if (scanCancelled) break;
@@ -1125,6 +1140,7 @@
       }
 
       const slezaResult = await checkWithSleza(pageData.text);
+      if (slezaResult.errors && !firstSlezaError) firstSlezaError = slezaResult.errors;
       const items = (slezaResult.items || []).map(parseSlezaItem);
       const checked = items.map(item => ({ ...item, ...checkMarkingNearby(pageData.text, item.name, item.category), pageUrl: url }));
 
@@ -1167,7 +1183,7 @@
 
     const aiData = await runAIAnalysis(c, egrul);
 
-    renderResults({ mode: 'full', origin, hostname, pages, aiData, source: urlList.source, egrul, stats });
+    renderResults({ mode: 'full', origin, hostname, pages, aiData, source: urlList.source, egrul, stats, slezaError: firstSlezaError });
   }
 
   // Пытается найти политику по типовым URL-путям, если ссылок в DOM не нашлось
@@ -1410,7 +1426,7 @@
     { law: 'Публичная оферта и условия возврата',law_code: 'ГК РФ ст.435, ЗоЗПП ст.26.1', fine: 'до 500 000 руб.',           status: 'unknown', issue: '', location: '', found_text: '', action: '' },
   ];
 
-  function renderResults({ mode, origin, hostname, pages, aiData, source, egrul, stats }) {
+  function renderResults({ mode, origin, hostname, pages, aiData, source, egrul, stats, slezaError }) {
     // Аггрегация по реестру
     const allItems = pages.flatMap(p => p.items);
     const inoItems = allItems.filter(i => i.category === 'inoagent');
@@ -1507,6 +1523,18 @@
       </div>
 
       <div class="sz-cl">// результаты по 7 законам</div>
+      ${slezaError ? `<div style="background:rgba(239,68,68,.08);border:1px solid rgba(239,68,68,.3);border-radius:8px;padding:10px 14px;margin-bottom:10px;font-family:'Courier New',monospace;font-size:11px;color:#f87171;line-height:1.6">
+        ⚠ API Слезы недоступен (${escapeHtml(String(slezaError))})<br>
+        <span style="color:#94a3b8">${
+          slezaError === 'no_key' ? 'SLEZA_KEY не заполнен — откройте скрипт в Tampermonkey и впишите ключ в строке 22.' :
+          /^http_(401|403)/.test(slezaError) ? 'Неверный SLEZA_KEY — проверьте API-ключ в настройках скрипта (строка ~22).' :
+          /^http_/.test(slezaError) ? 'API вернул ошибку. Проверьте статус sleza.media.' :
+          slezaError === 'timeout' ? 'API не ответил за 10 сек. Возможно перегрузка — попробуйте позже.' :
+          slezaError === 'net' ? 'Сетевая ошибка при обращении к sleza.media.' :
+          slezaError === 'parse' || /^parse_http_/.test(slezaError) ? 'API вернул не-JSON ответ.' :
+          'Иноагенты и экстремисты не проверены — отчёт неполный.'
+        }</span>
+      </div>` : ''}
       ${aiError ? `<div style="background:rgba(245,158,11,.08);border:1px solid rgba(245,158,11,.3);border-radius:8px;padding:10px 14px;margin-bottom:10px;font-family:'Courier New',monospace;font-size:11px;color:#fbbf24;line-height:1.6">
         ⚠ AI-анализ недоступен (${escapeHtml(String(aiError))})<br>
         <span style="color:#94a3b8">152-ФЗ и 149-ФЗ проверены локально. Остальные законы требуют GROQ_KEY — заполните в настройках скрипта.</span>
