@@ -505,6 +505,14 @@
     return result;
   }
 
+  // Определяет, что текущая страница — SPA (React/Vue/Next.js/Angular).
+  // Проверяет DOM: корневые контейнеры и путь к бандлированным скриптам.
+  function detectSpaFromDom() {
+    if (document.querySelector('#root,#app,#__next,#__nuxt,[data-reactroot],[data-v-app],[ng-version]')) return true;
+    const scripts = [...document.querySelectorAll('script[src]')];
+    return scripts.some(s => /\/_next\/static\/|\/static\/js\/(?:main|bundle|app)\.[a-f0-9]{6}|chunk\.[a-f0-9]{6}/.test(s.src || ''));
+  }
+
   function fetchUrl(url) {
     return new Promise(resolve => {
       if (scanCancelled) return resolve({ url, ok: false, html: '', text: '' });
@@ -1173,6 +1181,7 @@
       aiData,
       egrul,
       slezaError: slezaResult.errors || null,
+      spaWarning: detectSpaFromDom(),
     });
   }
 
@@ -1248,6 +1257,7 @@
     let skippedByFilter = 0; // счётчик пропущенных предфильтром
     let allPagesRawText = ''; // накапливаем хвосты страниц для поиска ИНН/ОГРН в подвалах
     let firstSlezaError = null; // первая ошибка API Слезы (для диагностики)
+    let spaLikeCount = 0; // страниц с признаками SPA-оболочки (мало текста, большой HTML)
 
     for (let i = 0; i < urls.length; i++) {
       if (scanCancelled) break;
@@ -1273,6 +1283,10 @@
         };
       } else {
         pageData = await fetchUrl(url);
+        // Считаем SPA-оболочки: мало текста при большом HTML — JS-рендеринг
+        if (pageData.ok && pageData.text.length < 200 && (pageData.html || '').length > 3000) {
+          spaLikeCount++;
+        }
       }
 
       if (!pageData.ok || !pageData.text) {
@@ -1335,7 +1349,8 @@
 
     const aiData = await runAIAnalysis(c, egrul, allPagesText);
 
-    renderResults({ mode: 'full', origin, hostname, pages, aiData, source: urlList.source, egrul, stats, slezaError: firstSlezaError });
+    const spaWarning = detectSpaFromDom() || (urls.length > 3 && spaLikeCount / urls.length > 0.3);
+    renderResults({ mode: 'full', origin, hostname, pages, aiData, source: urlList.source, egrul, stats, slezaError: firstSlezaError, spaWarning });
   }
 
   // Пытается найти политику по типовым URL-путям, если ссылок в DOM не нашлось
@@ -1593,7 +1608,7 @@
     { law: 'Публичная оферта и условия возврата',law_code: 'ГК РФ ст.435, ЗоЗПП ст.26.1', fine: 'до 500 000 руб.',           status: 'unknown', issue: '', location: '', found_text: '', action: '' },
   ];
 
-  function renderResults({ mode, origin, hostname, pages, aiData, source, egrul, stats, slezaError }) {
+  function renderResults({ mode, origin, hostname, pages, aiData, source, egrul, stats, slezaError, spaWarning }) {
     // Аггрегация по реестру
     const allItems = pages.flatMap(p => p.items);
     const inoItems = allItems.filter(i => i.category === 'inoagent');
@@ -1706,6 +1721,10 @@
       ${aiError ? `<div style="background:rgba(245,158,11,.08);border:1px solid rgba(245,158,11,.3);border-radius:8px;padding:10px 14px;margin-bottom:10px;font-family:'Courier New',monospace;font-size:11px;color:#fbbf24;line-height:1.6">
         ⚠ AI-анализ недоступен (${escapeHtml(String(aiError))})<br>
         <span style="color:#94a3b8">152-ФЗ и 149-ФЗ проверены локально. Остальные законы требуют GROQ_KEY — заполните в настройках скрипта.</span>
+      </div>` : ''}
+      ${spaWarning ? `<div style="background:rgba(96,165,250,.08);border:1px solid rgba(96,165,250,.3);border-radius:8px;padding:10px 14px;margin-bottom:10px;font-family:'Courier New',monospace;font-size:11px;color:#60a5fa;line-height:1.6">
+        ⚡ Сайт использует JavaScript-рендеринг (React / Vue / Next.js)<br>
+        <span style="color:#94a3b8">Подстраницы (политика, оферта, реквизиты) загружаются как пустой HTML-шаблон — часть данных может быть не найдена. Для точной проверки откройте нужную страницу в браузере и запустите <strong style="color:#e2e8f0">«Текущая страница»</strong>.</span>
       </div>` : ''}
       <div class="sz-checks">
         ${renderSlezaCheck(inoItems, 'Маркировка иноагентов', 'ФЗ №121, №255-ФЗ', '40 000 — 500 000 руб.', pages, 'inoagent')}
