@@ -652,6 +652,9 @@
 
   // ── Приоритизация URL по вероятности контента ──
   // Возвращает: 10 = контентная, 7 = главная, 5 = средняя, 3 = обычная, 1 = низкий приоритет, -1 = пропустить
+  // Глобальный сборщик причин отброса URL — для диагностики "0 контентных страниц"
+  const SKIP_REASONS = new Map(); // pattern → [пример URL, ...]
+
   function scoreUrl(url) {
     let path = '';
     let queryParamCount = 0;
@@ -663,7 +666,12 @@
     const full = (path + ' ' + url.toLowerCase());
 
     // Пропускаем URL с большим количеством query-параметров (фильтры, рефералки, варианты)
-    if (queryParamCount >= 2) return -1;
+    if (queryParamCount >= 2) {
+      const arr = SKIP_REASONS.get('queryParams>=2') || [];
+      if (arr.length < 3) arr.push(url);
+      SKIP_REASONS.set('queryParams>=2', arr);
+      return -1;
+    }
 
     // Пропускаем технические и каталожные страницы
     const SKIP = [
@@ -695,7 +703,14 @@
       // Пагинация
       /\/page\/\d+$/, /[?&]page=\d+/, /[?&]p=\d+/
     ];
-    if (SKIP.some(p => p.test(full))) return -1;
+    const matchedSkip = SKIP.find(p => p.test(full));
+    if (matchedSkip) {
+      const key = matchedSkip.toString();
+      const arr = SKIP_REASONS.get(key) || [];
+      if (arr.length < 3) arr.push(url);
+      SKIP_REASONS.set(key, arr);
+      return -1;
+    }
 
     // ВЫСОКИЙ приоритет — контентные страницы (блог, новости, архивы, публикации)
     const HIGH = [
@@ -1213,9 +1228,25 @@
     const totalDiscovered = urls.length;
 
     // ── Стратегия отбора: HIGH-контент с покрытием по годам ──
-    const scored = urls
+    SKIP_REASONS.clear(); // Сбрасываем диагностику с прошлого скана
+    let scored = urls
       .map(u => ({ url: u, score: scoreUrl(u) }))
       .filter(x => x.score >= 0); // отбрасываем технические страницы
+
+    // Fallback: если SKIP-фильтр отбросил >95% URL — нестандартная структура сайта.
+    // Логируем причины и берём все URL как LOW, чтобы хоть что-то просканировать.
+    let usedFallback = false;
+    if (scored.length === 0 && totalDiscovered > 0) {
+      try {
+        console.warn('[Слеза] scoreUrl отбросил все', totalDiscovered, 'URL. Топ-причины:');
+        for (const [pattern, examples] of SKIP_REASONS.entries()) {
+          console.warn('  •', pattern, '→', examples.slice(0, 3));
+        }
+        console.warn('[Слеза] Fallback: использую все URL как LOW (приоритет 3).');
+      } catch(_) {}
+      scored = urls.map(u => ({ url: u, score: 3 }));
+      usedFallback = true;
+    }
 
     const highPages = scored.filter(x => x.score >= 10).map(x => x.url);
     const medPages  = scored.filter(x => x.score === 5 || x.score === 7).map(x => x.url);
@@ -1254,6 +1285,8 @@
       totalHighFound: highPages.length,
       yearsCovered: yearsSorted,
       yearRange: yearsSorted.length > 0 ? `${yearsSorted[0]}–${yearsSorted[yearsSorted.length-1]}` : null,
+      usedFallback,
+      totalDiscovered,
     };
 
     // 2. Сканируем каждую страницу через API Слезы
@@ -1736,6 +1769,10 @@
       ${spaWarning ? `<div style="background:rgba(96,165,250,.08);border:1px solid rgba(96,165,250,.3);border-radius:8px;padding:10px 14px;margin-bottom:10px;font-family:'Courier New',monospace;font-size:11px;color:#60a5fa;line-height:1.6">
         ⚡ Сайт использует JavaScript-рендеринг (React / Vue / Next.js)<br>
         <span style="color:#94a3b8">Подстраницы (политика, оферта, реквизиты) загружаются как пустой HTML-шаблон — часть данных может быть не найдена. Для точной проверки откройте нужную страницу в браузере и запустите <strong style="color:#e2e8f0">«Текущая страница»</strong>.</span>
+      </div>` : ''}
+      ${stats?.usedFallback ? `<div style="background:rgba(251,191,36,.08);border:1px solid rgba(251,191,36,.3);border-radius:8px;padding:10px 14px;margin-bottom:10px;font-family:'Courier New',monospace;font-size:11px;color:#fbbf24;line-height:1.6">
+        ⚠ Нестандартная структура URL — приоритизация не сработала<br>
+        <span style="color:#94a3b8">В sitemap найдено ${stats.totalDiscovered} URL, но все попали под фильтр «технических страниц». Скан выполнен по всем URL без приоритета — результаты могут быть менее релевантными. Откройте DevTools (F12) → Console для деталей: какие URL и по какому правилу отброшены.</span>
       </div>` : ''}
       <div class="sz-checks">
         ${renderSlezaCheck(inoItems, 'Маркировка иноагентов', 'ФЗ №121, №255-ФЗ', '40 000 — 500 000 руб.', pages, 'inoagent')}
