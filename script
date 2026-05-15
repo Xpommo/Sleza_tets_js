@@ -605,12 +605,14 @@
   // 2) Если да — проверяем наличие оферты, условий возврата, информации о продавце
   function checkOffer(fullText, offerLinks) {
     if (!fullText || fullText.length < 100) {
-      return { found: 0, total: 4, items: [], status: 'unknown', isCommercial: false };
+      return { found: 0, total: 4, items: [], status: 'unknown', isCommercial: false, kind: null };
     }
     const t = fullText.toLowerCase();
 
-    // 1) Признаки коммерческого сайта
-    const commercialMarkers = [
+    // 1) Признаки коммерческого сайта — два независимых пула:
+    //    e-commerce (товары, доставка, корзина) и SaaS/услуги (лицензия, тариф, подписка).
+    //    Считаем коммерческим если в ЛЮБОМ пуле ≥2 совпадения.
+    const ecommerceMarkers = [
       /\b(купить|заказать|оформить\s+заказ|добавить\s+в\s+корзину)\b/i,
       /\bкорзин[аеуыой]\b/i,
       /\b(стоимость|цена|руб(\.|лей)?|₽)\b.{0,50}(\d{2,})/i,
@@ -618,8 +620,20 @@
       /(\d+[\s\-]*₽|\d+[\s\-]*руб)/i,
       /\b(оплат[аеу]|оплачивать)\b/i,
     ];
-    const commercialHits = commercialMarkers.filter(p => p.test(t)).length;
-    const isCommercial = commercialHits >= 2; // >=2 признаков = торговая площадка
+    const saasMarkers = [
+      /лицензиар[аеуо]?/i,
+      /лицензиат[аеуо]?/i,
+      /лицензионн[ыоаеми]+\s+(договор|соглашен|вознагражден|плат)/i,
+      /программн[оаеыми]+\s+обеспечен/i,
+      /(подписк|тариф|абонементн)[а-яё]+\s+(плат|стоимост|период|оплат)/i,
+      /\b(тариф|подписка|абонемент)[а-яё]*\b/i,
+      /личн[ыоом]+\s+кабинет/i,
+      /(SaaS|сервис|услуг[аеи]+).{0,30}(оплат|стоимост|тариф|подписк)/i,
+    ];
+    const ecommerceHits = ecommerceMarkers.filter(p => p.test(t)).length;
+    const saasHits      = saasMarkers.filter(p => p.test(t)).length;
+    const isCommercial  = ecommerceHits >= 2 || saasHits >= 2;
+    const kind          = saasHits >= 2 && saasHits >= ecommerceHits ? 'saas' : ecommerceHits >= 2 ? 'ecommerce' : null;
 
     const hasOfferLink = Array.isArray(offerLinks) && offerLinks.length > 0;
 
@@ -631,6 +645,7 @@
           /публичн[аыо][яе]\s+оферт/,
           /\bоферт[аеуы]\b/,
           /договор\s+(оферт|купли|присоединен|публичн)/,
+          /лицензионн[ыоаеми]+\s+договор/i,
           /правила\s+(продаж|использован|сайта)/,
           /пользовательск[оие]+\s+соглашен/,
         ],
@@ -639,29 +654,38 @@
       },
       {
         id: 'return_policy',
-        label: 'Условия возврата товара',
+        label: kind === 'saas' ? 'Условия расторжения / возврата' : 'Условия возврата товара',
         patterns: [
+          // E-commerce: возврат товара
           /возврат[\s,]+товар/i,
           /возврат\s+(денежн|средств|оплат)/i,
           /(7|семь|14|четырнадцать)\s+(дн[яей]+|календарн|рабоч)/,
-          /отказ[\s,]+от\s+(товар|услуг)/i,
+          /отказ[\s,]+от\s+(товар|услуг|подпис|серви)/i,
           /обмен\s+(товар|купленн|приобрет)/i,
           /политика\s+возврат/i,
+          // SaaS: условия расторжения договора, возврат средств, отказ от подписки
+          /расторжен[аиеяи][а-яё]*[\s\S]{0,150}(возврат|компенсаци|неизрасходованн)/i,
+          /(не\s+)?возвращ[аеи]+тся[\s\S]{0,80}(средств|оплат|деньг|сумм)/i,
+          /досрочн[а-яё]+\s+расторжен/i,
+          /приостановк[аи]+\s+(прав|подпис|услуг|серви)/i,
+          /(условия|порядок)\s+(возврат|расторжен|приостановк)/i,
         ],
       },
       {
         id: 'seller_info',
-        label: 'Информация о продавце (ИНН/название)',
+        label: kind === 'saas' ? 'Информация о лицензиаре (ИНН/название)' : 'Информация о продавце (ИНН/название)',
         patterns: [
           /(?:^|[\s>,.;:])ИНН[\s:№.]*[0-9]{10,12}/i,
           /(?:^|[\s>,.;:])ОГРН(?:ИП)?[\s:№.]*[0-9]{13,15}/i,
           /(?:^|[\s>])(ООО|ОАО|ЗАО|ПАО|АО|ИП)\s+[«"А-ЯЁ]/,
+          /(?:^|[\s>])(ООО|АО|ПАО|ЗАО|ОАО)\s+[«"][^"»]{2,80}["»]/,
           /индивидуальный\s+предприниматель/i,
+          /(общество\s+с\s+ограниченной\s+ответственностью|акционерное\s+общество)/i,
         ],
       },
       {
         id: 'contact_info',
-        label: 'Контакты продавца (email / телефон)',
+        label: 'Контакты (email / телефон)',
         patterns: [
           /[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/i,
           /(?:\+7|(?:^|\D)8)[\s\(\-]*\d{3}[\s\)\-]*\d{3}[\s\-]*\d{2}[\s\-]*\d{2}/,
@@ -669,7 +693,7 @@
       },
     ];
 
-    const result = { items: [], found: 0, total: checks.length, status: 'unknown', isCommercial };
+    const result = { items: [], found: 0, total: checks.length, status: 'unknown', isCommercial, kind };
     for (const c of checks) {
       let present = c.patterns.some(p => p.test(fullText));
       if (c.bonus) present = present || c.bonus;
@@ -2421,7 +2445,7 @@ U-47700;U-48800
     // ── Локальный чек-лист публичной оферты (ГК РФ ст.435, ЗоЗПП ст.26.1) ──
     const resultOffer = checkOffer(text149, c.offerLinks || []);
     msg += `\n═══ ЛОКАЛЬНЫЙ ЧЕК-ЛИСТ ОФЕРТЫ ═══\n`;
-    msg += `Коммерческий сайт: ${resultOffer.isCommercial ? 'ДА (есть признаки торговли)' : 'нет (информационный сайт)'}\n`;
+    msg += `Коммерческий сайт: ${resultOffer.isCommercial ? `ДА (${resultOffer.kind === 'saas' ? 'SaaS / лицензионный договор' : resultOffer.kind === 'ecommerce' ? 'e-commerce' : 'смешанная коммерческая модель'})` : 'нет (информационный сайт)'}\n`;
     if (resultOffer.isCommercial) {
       resultOffer.items.forEach(item => {
         msg += `${item.present ? '✓' : '✗'} ${item.label}\n`;
@@ -2605,17 +2629,20 @@ U-47700;U-48800
     const offer = out.find(c => c.law_code.includes('ст.435'));
     if (offer && resultOffer) {
       offer.status = resultOffer.status;
+      const kindHuman = resultOffer.kind === 'saas' ? 'SaaS / лицензионный договор' : resultOffer.kind === 'ecommerce' ? 'торговая площадка' : null;
       if (!resultOffer.isCommercial) {
-        offer.issue = 'Признаков торговой деятельности не обнаружено — оферта не обязательна';
+        offer.issue = 'Признаков торговой / SaaS-деятельности не обнаружено — оферта не обязательна';
         offer.action = '—';
       } else if (resultOffer.status === 'ok') {
-        offer.issue = 'Публичная оферта, условия возврата и реквизиты продавца на месте';
+        offer.issue = `Публичная оферта, условия расторжения / возврата и реквизиты на месте (${kindHuman})`;
         offer.action = '—';
       } else {
         const missing = resultOffer.items.filter(i => !i.present).map(i => i.label.toLowerCase()).join('; ');
-        offer.issue = `Отсутствует: ${missing}`;
+        offer.issue = `Отсутствует: ${missing}${kindHuman ? ` (${kindHuman})` : ''}`;
         offer.action = resultOffer.status === 'violation'
-          ? 'Создать публичную оферту с условиями возврата (ЗоЗПП ст.26.1 — возврат в течение 7 дней) и указать реквизиты продавца'
+          ? (resultOffer.kind === 'saas'
+              ? 'Опубликовать лицензионный договор / публичную оферту с условиями расторжения и реквизитами лицензиара'
+              : 'Создать публичную оферту с условиями возврата (ЗоЗПП ст.26.1 — возврат в течение 7 дней) и указать реквизиты продавца')
           : 'Дополнить оферту недостающими элементами';
       }
     }
@@ -3086,13 +3113,14 @@ U-47700;U-48800
     if (!r.isCommercial) {
       return `<div class="sz-egrul-block good">
         <div class="sz-egrul-title">✓ Информационный сайт</div>
-        <div class="sz-egrul-desc">Признаков торговой деятельности не обнаружено — публичная оферта и условия возврата не обязательны.</div>
+        <div class="sz-egrul-desc">Признаков торговой / SaaS-деятельности не обнаружено — публичная оферта и условия возврата не обязательны.</div>
       </div>`;
     }
+    const kindLabel = r.kind === 'saas' ? 'SaaS / лицензионный договор' : r.kind === 'ecommerce' ? 'E-commerce / товары' : 'Коммерческая деятельность';
     const cls = r.status === 'ok' ? 'good' : r.status === 'risk' ? 'warn' : 'bad';
     const icon = r.status === 'ok' ? '✓' : r.status === 'risk' ? '⚠' : '✗';
-    const title = r.status === 'ok' ? `Оферта на месте (${r.found} из ${r.total})` :
-                  r.status === 'risk' ? `Оферта неполная (${r.found} из ${r.total})` :
+    const title = r.status === 'ok' ? `Оферта на месте (${r.found} из ${r.total}) · ${kindLabel}` :
+                  r.status === 'risk' ? `Оферта неполная (${r.found} из ${r.total}) · ${kindLabel}` :
                   `Критические пробелы (${r.found} из ${r.total})`;
     const items = r.items.map(item => {
       const iconChar = item.present ? '✓' : '✗';
