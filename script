@@ -22,6 +22,15 @@
   const SLEZA_KEY = 'YOUR_SLEZA_API_KEY_HERE';
   // ──────────────────────────────────────────────
 
+  // ── Поведение AI ──────────────────────────────
+  // false — Groq НЕ вызывается, отчёт строится только из локальных чек-листов.
+  //          Экономит токены / снимает зависимость от rate-limit.
+  // true  — Groq вызывается для полировки текста карточек (issue/action),
+  //          локальные вердикты по-прежнему перекрывают AI-статус.
+  // Также автоматически отключается если GROQ_KEY пустой/placeholder.
+  const USE_AI = true;
+  // ──────────────────────────────────────────────
+
   // ── Настройки краулера ────────────────────────
   const MAX_PAGES        = 200;  // максимум страниц для скана
   const MAX_DEPTH        = 2;    // глубина обхода если нет sitemap
@@ -2364,7 +2373,9 @@ U-47700;U-48800
     let result152 = check152FZ(policyText);
     // AI-арбитр: если локально найдено 1-5 из 7 — спрашиваем модель по каждому пропущенному пункту.
     // Никогда не понижает статус, только дополняет. При ошибке/таймауте — возвращает локальный результат.
-    if (result152.status !== 'no_policy' && result152.found >= 1 && result152.found < 6) {
+    // Пропускается если USE_AI=false или нет ключа.
+    const groqForArbiter = USE_AI && GROQ_KEY && GROQ_KEY !== 'YOUR_GROQ_API_KEY_HERE';
+    if (groqForArbiter && result152.status !== 'no_policy' && result152.found >= 1 && result152.found < 6) {
       result152 = await verify152FZWithAI(policyText, result152);
     }
     if (result152.status !== 'no_policy') {
@@ -2438,6 +2449,19 @@ U-47700;U-48800
     msg += `Локальный вывод: ${resultDrugs.status === 'ok' ? (resultDrugs.hasMentions ? 'упоминания в допустимом контексте' : 'упоминаний нет') : resultDrugs.status === 'risk' ? 'есть упоминания без явного контекста — нужна проверка' : 'упоминания без контекста — потенциальное нарушение ст.6.13 КоАП'}\n`;
     msg += `═══════════════════════════════════════════\n`;
 
+    // ── Если AI отключён или нет ключа — собираем отчёт только из локальных чек-листов ──
+    const groqAvailable = USE_AI && GROQ_KEY && GROQ_KEY !== 'YOUR_GROQ_API_KEY_HERE';
+    if (!groqAvailable) {
+      try { console.log('[Слеза] Groq пропущен (USE_AI=' + USE_AI + ', key=' + (GROQ_KEY === 'YOUR_GROQ_API_KEY_HERE' ? 'нет' : 'есть') + '). Используем локальные чек-листы.'); } catch(_) {}
+      return {
+        site_name: c.title || c.url,
+        site_type: '',
+        summary: 'Отчёт собран из локальных детерминированных проверок (без AI).',
+        checks: buildLocalChecks({ result152, result149, resultERIR, resultOffer, resultDrugs, egrul }),
+        fetched, result152, result149, resultERIR, resultOffer, resultDrugs,
+      };
+    }
+
     return new Promise(resolve => {
       GM_xmlhttpRequest({
         method: 'POST',
@@ -2461,10 +2485,20 @@ U-47700;U-48800
             if (!m) throw new Error('parse');
             const parsed = JSON.parse(m[0]);
             resolve({ ...parsed, fetched, result152, result149, resultERIR, resultOffer, resultDrugs });
-          } catch(e) { resolve({ error: e.message, fetched, result152, result149, resultERIR, resultOffer, resultDrugs }); }
+          } catch(e) {
+            // Groq упал/rate-limit/parse — собираем отчёт из локальных результатов, не теряем данные
+            const localChecks = buildLocalChecks({ result152, result149, resultERIR, resultOffer, resultDrugs, egrul });
+            resolve({ error: e.message, checks: localChecks, summary: 'Groq недоступен — отчёт собран из локальных проверок.', fetched, result152, result149, resultERIR, resultOffer, resultDrugs });
+          }
         },
-        onerror()   { resolve({ error: 'net',     fetched, result152, result149, resultERIR, resultOffer, resultDrugs }); },
-        ontimeout() { resolve({ error: 'timeout', fetched, result152, result149, resultERIR, resultOffer, resultDrugs }); }
+        onerror() {
+          const localChecks = buildLocalChecks({ result152, result149, resultERIR, resultOffer, resultDrugs, egrul });
+          resolve({ error: 'net', checks: localChecks, summary: 'Groq недоступен (сетевая ошибка) — отчёт собран из локальных проверок.', fetched, result152, result149, resultERIR, resultOffer, resultDrugs });
+        },
+        ontimeout() {
+          const localChecks = buildLocalChecks({ result152, result149, resultERIR, resultOffer, resultDrugs, egrul });
+          resolve({ error: 'timeout', checks: localChecks, summary: 'Groq не ответил вовремя — отчёт собран из локальных проверок.', fetched, result152, result149, resultERIR, resultOffer, resultDrugs });
+        }
       });
     });
   }
@@ -2486,6 +2520,109 @@ U-47700;U-48800
     { law: 'Публичная оферта и условия возврата',law_code: 'ГК РФ ст.435, ЗоЗПП ст.26.1', fine: 'до 500 000 руб.',           status: 'unknown', issue: '', location: '', found_text: '', action: '' },
   ];
 
+  // Текстовые шаблоны issue/action по каждому закону на основе локальных результатов.
+  // Используется когда Groq отключён или недоступен — отчёт остаётся полным.
+  function buildLocalChecks({ result152, result149, resultERIR, resultOffer, resultDrugs, egrul }) {
+    const out = AI_LAW_STUBS.map(s => ({ ...s }));
+
+    // 1) Наркотики
+    const drugs = out.find(c => c.law_code.includes('ст.6.13'));
+    if (drugs && resultDrugs) {
+      drugs.status = resultDrugs.status;
+      if (!resultDrugs.hasMentions) {
+        drugs.issue = 'Упоминаний запрещённых веществ не обнаружено';
+        drugs.action = '—';
+      } else if (resultDrugs.status === 'ok') {
+        drugs.issue = `${resultDrugs.totalMentions} упоминаний в допустимом контексте (УК, медицина, профилактика)`;
+        drugs.action = '—';
+      } else {
+        const top = resultDrugs.mentions.filter(m => !m.hasContext).slice(0, 3).map(m => `«${m.term}»`).join(', ');
+        drugs.issue = `${resultDrugs.withoutContext} упоминаний без явного контекста: ${top}`;
+        drugs.found_text = top;
+        drugs.action = resultDrugs.status === 'violation'
+          ? 'Удалить упоминания или добавить ссылку на статью УК / профилактический контекст. По ст.6.13 КоАП — пропаганда наркотиков'
+          : 'Добавить дисклеймер или контекст (статья УК, медицинская публикация, новость о борьбе)';
+      }
+    }
+
+    // 2) 152-ФЗ
+    const law152 = out.find(c => c.law_code.includes('152-ФЗ'));
+    if (law152 && result152) {
+      law152.status = result152.status === 'no_policy' ? 'violation' : result152.status;
+      if (result152.status === 'no_policy') {
+        law152.issue = 'Политика конфиденциальности не найдена на сайте';
+        law152.action = 'Создать и разместить политику обработки персональных данных (152-ФЗ ст.18.1) — обязательна для всех сайтов, собирающих данные';
+      } else if (result152.status === 'ok') {
+        law152.issue = `Политика конфиденциальности соответствует требованиям 152-ФЗ (${result152.found} из ${result152.total} пунктов)`;
+        law152.action = '—';
+      } else {
+        const missing = result152.items.filter(i => !i.present).map(i => i.label.toLowerCase()).join('; ');
+        law152.issue = `Политика неполная — отсутствует: ${missing}`;
+        law152.action = result152.status === 'violation'
+          ? 'Переработать политику с учётом всех 7 пунктов ст.18.1 152-ФЗ'
+          : 'Дополнить отсутствующие обязательные пункты политики';
+      }
+    }
+
+    // 3) ЕРИР
+    const erir = out.find(c => c.law_code.includes('ФЗ №347'));
+    if (erir && resultERIR) {
+      erir.status = resultERIR.status;
+      if (!resultERIR.hasAdContent) {
+        erir.issue = 'Рекламного контента не обнаружено';
+        erir.action = '—';
+      } else if (resultERIR.status === 'ok') {
+        erir.issue = 'Реклама маркирована корректно: токен ERID, метка «реклама», информация о рекламодателе';
+        erir.action = '—';
+      } else {
+        const missing = resultERIR.items.filter(i => !i.present).map(i => i.label.toLowerCase()).join('; ');
+        erir.issue = `Реклама без обязательной маркировки: отсутствует ${missing}`;
+        erir.action = resultERIR.status === 'violation'
+          ? 'Получить ERID через ОРД, добавить метку «реклама» и информацию о рекламодателе. С 01.09.2022 это обязательно'
+          : 'Дополнить маркировку рекламных публикаций';
+      }
+    }
+
+    // 4) 149-ФЗ
+    const law149 = out.find(c => c.law_code.includes('149-ФЗ'));
+    if (law149 && result149) {
+      const egrulInactive = egrul?.result?.parsed && egrul.result.parsed.isActive === false;
+      law149.status = egrulInactive ? 'violation' : result149.status;
+      if (egrulInactive) {
+        law149.issue = `Организация прекращена в ЕГРЮЛ — ${egrul.result.parsed.reason || 'деятельность прекращена'}`;
+        law149.action = 'Обновить реквизиты на сайте — указанная организация не ведёт деятельность';
+      } else if (result149.status === 'ok') {
+        law149.issue = `Обязательные реквизиты владельца на сайте указаны (${result149.found} из ${result149.total})`;
+        law149.action = '—';
+      } else {
+        const missing = result149.items.filter(i => !i.present).map(i => i.label.toLowerCase()).join('; ');
+        law149.issue = `Отсутствует: ${missing}`;
+        law149.action = 'Добавить недостающие реквизиты владельца (149-ФЗ ст.10): ИНН, ОГРН, полное наименование, адрес, контакты';
+      }
+    }
+
+    // 5) Оферта
+    const offer = out.find(c => c.law_code.includes('ст.435'));
+    if (offer && resultOffer) {
+      offer.status = resultOffer.status;
+      if (!resultOffer.isCommercial) {
+        offer.issue = 'Признаков торговой деятельности не обнаружено — оферта не обязательна';
+        offer.action = '—';
+      } else if (resultOffer.status === 'ok') {
+        offer.issue = 'Публичная оферта, условия возврата и реквизиты продавца на месте';
+        offer.action = '—';
+      } else {
+        const missing = resultOffer.items.filter(i => !i.present).map(i => i.label.toLowerCase()).join('; ');
+        offer.issue = `Отсутствует: ${missing}`;
+        offer.action = resultOffer.status === 'violation'
+          ? 'Создать публичную оферту с условиями возврата (ЗоЗПП ст.26.1 — возврат в течение 7 дней) и указать реквизиты продавца'
+          : 'Дополнить оферту недостающими элементами';
+      }
+    }
+
+    return out;
+  }
+
   function renderResults({ mode, origin, hostname, pages, aiData, source, egrul, stats, slezaError, spaWarning }) {
     // Аггрегация по реестру
     const allItems = pages.flatMap(p => p.items);
@@ -2496,14 +2633,9 @@ U-47700;U-48800
 
     const aiWorked = aiData && aiData.checks && aiData.checks.length > 0;
     const aiError  = aiData && aiData.error;
-    const aiChecks = aiWorked
-      ? aiData.checks
-      : AI_LAW_STUBS.map(s => ({
-          ...s,
-          // Для законов без локального переопределения — сообщаем, что нужен GROQ_KEY
-          issue:  s.law_code.includes('152-ФЗ') || s.law_code.includes('149-ФЗ') ? '' : 'Требуется AI-анализ — заполните GROQ_KEY в настройках скрипта',
-          action: s.law_code.includes('152-ФЗ') || s.law_code.includes('149-ФЗ') ? '' : 'Добавьте GROQ_KEY и повторите сканирование',
-        }));
+    // aiData.checks теперь всегда есть (либо от Groq, либо от buildLocalChecks).
+    // AI_LAW_STUBS используется только если aiData вообще нет (что не должно случаться).
+    const aiChecks = aiWorked ? aiData.checks : AI_LAW_STUBS.map(s => ({ ...s }));
     const totalSlezaUnmarked = inoUnmarked.length + extUnmarked.length;
     const totalAIViolations = aiChecks.filter(c => c.status === 'violation').length;
     const totalViolations = totalSlezaUnmarked + totalAIViolations;
@@ -2594,8 +2726,8 @@ U-47700;U-48800
         }</span>
       </div>` : ''}
       ${aiError ? `<div style="background:rgba(245,158,11,.08);border:1px solid rgba(245,158,11,.3);border-radius:8px;padding:10px 14px;margin-bottom:10px;font-family:'Courier New',monospace;font-size:11px;color:#fbbf24;line-height:1.6">
-        ⚠ AI-анализ недоступен (${escapeHtml(String(aiError))})<br>
-        <span style="color:#94a3b8">152-ФЗ и 149-ФЗ проверены локально. Остальные законы требуют GROQ_KEY — заполните в настройках скрипта.</span>
+        ⚠ AI-полировка отчёта недоступна (${escapeHtml(String(aiError))})<br>
+        <span style="color:#94a3b8">Все 5 законов проверены локально (детерминированные чек-листы). AI добавлял бы только литературные формулировки в карточках — на вердикты это не влияет.</span>
       </div>` : ''}
       ${spaWarning ? `<div style="background:rgba(96,165,250,.08);border:1px solid rgba(96,165,250,.3);border-radius:8px;padding:10px 14px;margin-bottom:10px;font-family:'Courier New',monospace;font-size:11px;color:#60a5fa;line-height:1.6">
         ⚡ Сайт использует JavaScript-рендеринг (React / Vue / Next.js)<br>
