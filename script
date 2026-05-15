@@ -603,6 +603,43 @@
   // Логика:
   // 1) Определяем — это коммерческий сайт (есть признаки торговли)?
   // 2) Если да — проверяем наличие оферты, условий возврата, информации о продавце
+  // ── Чек cookie-compliance (152-ФЗ + ст.13.11 КоАП в части автоматизированной обработки) ──
+  // Логика юриста: если сайт собирает cookies/использует трекинг — нужен баннер согласия.
+  // Если трекинга нет — баннер не обязателен.
+  function checkCookieCompliance({ hasTracking, hasCookieBanner, policyHasCookies }) {
+    // Дополнительный сигнал: если в политике явно описаны cookies — это компенсирует отсутствие баннера
+    if (!hasTracking) {
+      return {
+        hasTracking: false, hasCookieBanner, policyHasCookies,
+        status: 'ok',
+        title: 'Трекинг не обнаружен',
+        message: 'Аналитические скрипты не найдены — баннер согласия на cookie не обязателен.',
+      };
+    }
+    if (hasCookieBanner) {
+      return {
+        hasTracking: true, hasCookieBanner: true, policyHasCookies,
+        status: 'ok',
+        title: 'Баннер согласия на cookie присутствует',
+        message: 'Трекинг обнаружен, согласие на использование cookie запрашивается у пользователя.',
+      };
+    }
+    if (policyHasCookies) {
+      return {
+        hasTracking: true, hasCookieBanner: false, policyHasCookies: true,
+        status: 'risk',
+        title: 'Баннер согласия на cookie отсутствует, но cookies описаны в политике',
+        message: 'Трекинг работает, политика упоминает cookies — но активного баннера согласия нет. Это серая зона: рекомендуется добавить баннер.',
+      };
+    }
+    return {
+      hasTracking: true, hasCookieBanner: false, policyHasCookies: false,
+      status: 'violation',
+      title: 'Баннер согласия на cookie отсутствует',
+      message: 'Сайт использует трекинг (Яндекс.Метрика / GA / Pixel / и т.п.), но не получает явного согласия пользователя на обработку cookie. Нарушение 152-ФЗ ст.9 и ст.6 в части автоматизированной обработки.',
+    };
+  }
+
   function checkOffer(fullText, offerLinks) {
     if (!fullText || fullText.length < 100) {
       return { found: 0, total: 4, items: [], status: 'unknown', isCommercial: false, kind: null };
@@ -1702,8 +1739,32 @@ U-47700;U-48800
       offerLinks:  uniqueLinks.filter(l => m(l, KW.offer)).slice(0, 2),
       returnLinks: uniqueLinks.filter(l => m(l, KW.ret)).slice(0, 2),
       aboutLinks:  uniqueLinks.filter(l => m(l, KW.about)).slice(0, 2),
-      hasAdScripts: document.querySelectorAll('script[src*="googletagmanager"],script[src*="yandex"],script[src*="vk.com/js"]').length > 0,
-      hasCookieBanner: !!document.querySelector('[class*="cookie"i],[id*="cookie"i],[class*="consent"i],[id*="consent"i]')
+      // Расширенная детекция трекинга — Yandex Metrica, Google Analytics, VK, Mail.ru,
+      // Facebook Pixel, Hotjar, Mixpanel, Roistat, AmoCRM, Bitrix24, и т.п.
+      hasAdScripts: document.querySelectorAll(
+        'script[src*="googletagmanager"],script[src*="google-analytics"],script[src*="gtag"],' +
+        'script[src*="mc.yandex"],script[src*="yandex.ru/metrika"],script[src*="yandex.ru/watch"],' +
+        'script[src*="vk.com/js"],script[src*="vk-tracker"],script[src*="vk.com/rtrg"],' +
+        'script[src*="top.mail.ru"],script[src*="counter.yadro"],' +
+        'script[src*="connect.facebook"],script[src*="fbq"],' +
+        'script[src*="hotjar"],script[src*="mixpanel"],script[src*="amplitude"],' +
+        'script[src*="roistat"],script[src*="bitrix"],script[src*="amocrm"]'
+      ).length > 0 ||
+        // Также проверяем наличие inline-кода Метрики/GA в HTML
+        /(ym\s*\(\s*\d|gtag\(|fbq\(|_tmr\.push|VK\.Retargeting)/.test(document.documentElement.innerHTML.slice(0, 100000)),
+      // Cookie-баннер: расширенная детекция
+      hasCookieBanner: !!document.querySelector(
+        '[class*="cookie"i],[id*="cookie"i],' +
+        '[class*="consent"i],[id*="consent"i],' +
+        '[class*="gdpr"i],[id*="gdpr"i],' +
+        '[class*="privacy-banner"i],[class*="policy-banner"i]'
+      ) || /cookie|куки/.test(
+        // Ищем явный баннер в первых 50KB DOM с текстом про cookie
+        [...document.querySelectorAll('div[role="dialog"],div[role="banner"],aside,[class*="banner"i],[class*="popup"i]')]
+          .map(e => (e.textContent || '').slice(0, 200))
+          .join(' ')
+          .toLowerCase()
+      )
     };
   }
 
@@ -2494,6 +2555,21 @@ U-47700;U-48800
     msg += `Локальный вывод: ${resultOffer.status === 'ok' ? (resultOffer.isCommercial ? 'оферта и реквизиты на месте' : 'не торговая площадка — оферта не обязательна') : resultOffer.status === 'risk' ? 'часть требований не выполнена' : 'критические пробелы (нет оферты/возврата/реквизитов)'}\n`;
     msg += `═══════════════════════════════════════════\n`;
 
+    // ── Cookie compliance: трекинг + баннер ──
+    const policyText_lc = ((fetched.policy || []).map(p => p.text).join('\n')).toLowerCase();
+    const policyHasCookies = /cookie|куки|файл[ы]?\s+cookie/i.test(policyText_lc);
+    const resultCookie = checkCookieCompliance({
+      hasTracking: !!c.hasAdScripts,
+      hasCookieBanner: !!c.hasCookieBanner,
+      policyHasCookies,
+    });
+    msg += `\n═══ ЛОКАЛЬНЫЙ ЧЕК COOKIE-COMPLIANCE ═══\n`;
+    msg += `Трекинг: ${resultCookie.hasTracking ? 'ОБНАРУЖЕН' : 'не обнаружен'}\n`;
+    msg += `Cookie-баннер: ${resultCookie.hasCookieBanner ? 'есть' : 'нет'}\n`;
+    msg += `Cookies упоминаются в политике: ${policyHasCookies ? 'да' : 'нет'}\n`;
+    msg += `Локальный вывод: ${resultCookie.title}\n`;
+    msg += `═══════════════════════════════════════════\n`;
+
     // ── Локальный чек-лист наркотиков (ст.6.13 КоАП, ФЗ №3) ──
     const resultDrugs = checkDrugs(text149);
     msg += `\n═══ ЛОКАЛЬНЫЙ ЧЕК-ЛИСТ НАРКОТИКИ ═══\n`;
@@ -2521,8 +2597,8 @@ U-47700;U-48800
         site_name: c.title || c.url,
         site_type: '',
         summary: 'Отчёт собран из локальных детерминированных проверок (без AI).',
-        checks: buildLocalChecks({ result152, result149, resultERIR, resultOffer, resultDrugs, egrul }),
-        fetched, result152, result149, resultERIR, resultOffer, resultDrugs,
+        checks: buildLocalChecks({ result152, result149, resultERIR, resultOffer, resultDrugs, resultCookie, egrul }),
+        fetched, result152, result149, resultERIR, resultOffer, resultDrugs, resultCookie,
       };
     }
 
@@ -2548,20 +2624,20 @@ U-47700;U-48800
             const m = txt.match(/\{[\s\S]*\}/);
             if (!m) throw new Error('parse');
             const parsed = JSON.parse(m[0]);
-            resolve({ ...parsed, fetched, result152, result149, resultERIR, resultOffer, resultDrugs });
+            resolve({ ...parsed, fetched, result152, result149, resultERIR, resultOffer, resultDrugs, resultCookie });
           } catch(e) {
             // Groq упал/rate-limit/parse — собираем отчёт из локальных результатов, не теряем данные
-            const localChecks = buildLocalChecks({ result152, result149, resultERIR, resultOffer, resultDrugs, egrul });
-            resolve({ error: e.message, checks: localChecks, summary: 'Groq недоступен — отчёт собран из локальных проверок.', fetched, result152, result149, resultERIR, resultOffer, resultDrugs });
+            const localChecks = buildLocalChecks({ result152, result149, resultERIR, resultOffer, resultDrugs, resultCookie, egrul });
+            resolve({ error: e.message, checks: localChecks, summary: 'Groq недоступен — отчёт собран из локальных проверок.', fetched, result152, result149, resultERIR, resultOffer, resultDrugs, resultCookie });
           }
         },
         onerror() {
-          const localChecks = buildLocalChecks({ result152, result149, resultERIR, resultOffer, resultDrugs, egrul });
-          resolve({ error: 'net', checks: localChecks, summary: 'Groq недоступен (сетевая ошибка) — отчёт собран из локальных проверок.', fetched, result152, result149, resultERIR, resultOffer, resultDrugs });
+          const localChecks = buildLocalChecks({ result152, result149, resultERIR, resultOffer, resultDrugs, resultCookie, egrul });
+          resolve({ error: 'net', checks: localChecks, summary: 'Groq недоступен (сетевая ошибка) — отчёт собран из локальных проверок.', fetched, result152, result149, resultERIR, resultOffer, resultDrugs, resultCookie });
         },
         ontimeout() {
-          const localChecks = buildLocalChecks({ result152, result149, resultERIR, resultOffer, resultDrugs, egrul });
-          resolve({ error: 'timeout', checks: localChecks, summary: 'Groq не ответил вовремя — отчёт собран из локальных проверок.', fetched, result152, result149, resultERIR, resultOffer, resultDrugs });
+          const localChecks = buildLocalChecks({ result152, result149, resultERIR, resultOffer, resultDrugs, resultCookie, egrul });
+          resolve({ error: 'timeout', checks: localChecks, summary: 'Groq не ответил вовремя — отчёт собран из локальных проверок.', fetched, result152, result149, resultERIR, resultOffer, resultDrugs, resultCookie });
         }
       });
     });
@@ -2586,7 +2662,7 @@ U-47700;U-48800
 
   // Текстовые шаблоны issue/action по каждому закону на основе локальных результатов.
   // Используется когда Groq отключён или недоступен — отчёт остаётся полным.
-  function buildLocalChecks({ result152, result149, resultERIR, resultOffer, resultDrugs, egrul }) {
+  function buildLocalChecks({ result152, result149, resultERIR, resultOffer, resultDrugs, resultCookie, egrul }) {
     const out = AI_LAW_STUBS.map(s => ({ ...s }));
 
     // 1) Наркотики
@@ -2609,22 +2685,35 @@ U-47700;U-48800
       }
     }
 
-    // 2) 152-ФЗ
+    // 2) 152-ФЗ + Cookie compliance
     const law152 = out.find(c => c.law_code.includes('152-ФЗ'));
     if (law152 && result152) {
       law152.status = result152.status === 'no_policy' ? 'violation' : result152.status;
+      // Cookie может ужесточить статус: policy ok + cookie violation → risk
+      if (resultCookie) {
+        if (resultCookie.status === 'violation' && law152.status === 'ok') law152.status = 'risk';
+        else if (resultCookie.status === 'risk'  && law152.status === 'ok') law152.status = 'risk';
+      }
+      const cookieNote = resultCookie && resultCookie.status !== 'ok'
+        ? ` Дополнительно: ${resultCookie.title.toLowerCase()}.`
+        : '';
+      const cookieAction = resultCookie && resultCookie.status === 'violation'
+        ? ' Добавить cookie-баннер с согласием пользователя на использование трекинга.'
+        : resultCookie && resultCookie.status === 'risk'
+          ? ' Рекомендуется добавить активный cookie-баннер на странице.'
+          : '';
       if (result152.status === 'no_policy') {
-        law152.issue = 'Политика конфиденциальности не найдена на сайте';
-        law152.action = 'Создать и разместить политику обработки персональных данных (152-ФЗ ст.18.1) — обязательна для всех сайтов, собирающих данные';
+        law152.issue = 'Политика конфиденциальности не найдена на сайте.' + cookieNote;
+        law152.action = 'Создать и разместить политику обработки персональных данных (152-ФЗ ст.18.1) — обязательна для всех сайтов, собирающих данные.' + cookieAction;
       } else if (result152.status === 'ok') {
-        law152.issue = `Политика конфиденциальности соответствует требованиям 152-ФЗ (${result152.found} из ${result152.total} пунктов)`;
-        law152.action = '—';
+        law152.issue = `Политика конфиденциальности соответствует требованиям 152-ФЗ (${result152.found} из ${result152.total} пунктов).` + cookieNote;
+        law152.action = cookieAction.trim() || '—';
       } else {
         const missing = result152.items.filter(i => !i.present).map(i => i.label.toLowerCase()).join('; ');
-        law152.issue = `Политика неполная — отсутствует: ${missing}`;
-        law152.action = result152.status === 'violation'
-          ? 'Переработать политику с учётом всех 7 пунктов ст.18.1 152-ФЗ'
-          : 'Дополнить отсутствующие обязательные пункты политики';
+        law152.issue = `Политика неполная — отсутствует: ${missing}.` + cookieNote;
+        law152.action = (result152.status === 'violation'
+          ? 'Переработать политику с учётом всех 7 пунктов ст.18.1 152-ФЗ.'
+          : 'Дополнить отсутствующие обязательные пункты политики.') + cookieAction;
       }
     }
 
@@ -2811,7 +2900,7 @@ U-47700;U-48800
       <div class="sz-checks">
         ${renderSlezaCheck(inoItems, 'Маркировка иноагентов', 'ФЗ №121, №255-ФЗ', '40 000 — 500 000 руб.', pages, 'inoagent')}
         ${renderSlezaCheck(extItems, 'Маркировка экстремистов / террористов', 'ст.13.15 КоАП, ФЗ №114', 'до 500 000 руб.', pages, 'extremist')}
-        ${aiChecks.map((ch, i) => renderAICheck(ch, i, egrul, aiData?.result152, aiData?.result149, aiData?.resultERIR, aiData?.resultOffer, aiData?.resultDrugs)).join('')}
+        ${aiChecks.map((ch, i) => renderAICheck(ch, i, egrul, aiData?.result152, aiData?.result149, aiData?.resultERIR, aiData?.resultOffer, aiData?.resultDrugs, aiData?.resultCookie)).join('')}
       </div>
 
       <div class="sz-cta">
@@ -2952,7 +3041,7 @@ U-47700;U-48800
     return many;
   }
 
-  function renderAICheck(ch, i, egrul, result152, result149, resultERIR, resultOffer, resultDrugs) {
+  function renderAICheck(ch, i, egrul, result152, result149, resultERIR, resultOffer, resultDrugs, resultCookie) {
     const st = ST[ch.status] || ST.unknown;
     const showLoc = ch.status !== 'ok' && ch.status !== 'unknown' && ch.found_text && !ch.found_text.toLowerCase().includes('отсутств');
     const showQuote = ch.found_text && !ch.found_text.toLowerCase().includes('отсутств') && ch.status !== 'ok';
@@ -2963,10 +3052,12 @@ U-47700;U-48800
       egrulBlock = renderEgrulBlock(egrul);
     }
 
-    // Блок чек-листа 152-ФЗ
+    // Блок чек-листа 152-ФЗ + блок Cookie compliance (тоже в 152-ФЗ карточке)
     let block152 = '';
+    let blockCookie = '';
     if (result152 && (ch.law_code || '').includes('152-ФЗ')) {
       block152 = render152Block(result152);
+      if (resultCookie) blockCookie = renderCookieBlock(resultCookie);
     }
 
     // Блок чек-листа 149-ФЗ
@@ -3002,7 +3093,15 @@ U-47700;U-48800
       else if (localStatus === 'risk') { effectiveStatus = 'risk'; effectiveLabel = ST.risk.label; effectiveCls = ST.risk.cls; }
       else if (localStatus === 'violation' || localStatus === 'no_policy') { effectiveStatus = 'violation'; effectiveLabel = ST.violation.label; effectiveCls = ST.violation.cls; }
     };
-    if (result152 && (ch.law_code || '').includes('152-ФЗ')) overrideFromLocal(result152.status);
+    if (result152 && (ch.law_code || '').includes('152-ФЗ')) {
+      overrideFromLocal(result152.status);
+      // Cookie-нарушение может ужесточить статус 152-ФЗ (но не ослабить)
+      if (resultCookie && resultCookie.status === 'violation' && effectiveStatus === 'ok') {
+        overrideFromLocal('risk'); // policy ok, но cookie нарушен → risk
+      } else if (resultCookie && resultCookie.status === 'risk' && effectiveStatus === 'ok') {
+        overrideFromLocal('risk');
+      }
+    }
     if (result149 && (ch.law_code || '').includes('149-ФЗ')) {
       // ЕГРЮЛ может ужесточить статус: организация прекращена → нарушение независимо от чек-листа
       const egrulInactive = egrul?.result?.parsed && egrul.result.parsed.isActive === false;
@@ -3012,7 +3111,7 @@ U-47700;U-48800
     if (resultOffer && (ch.law_code || '').includes('ст.435'))  overrideFromLocal(resultOffer.status);
     if (resultDrugs && (ch.law_code || '').includes('ст.6.13')) overrideFromLocal(resultDrugs.status);
 
-    const hasLocalCheck = block152 || block149 || blockERIR || blockOffer || blockDrugs;
+    const hasLocalCheck = block152 || block149 || blockERIR || blockOffer || blockDrugs || blockCookie;
 
     return `
       <div class="sz-check ${effectiveCls}">
@@ -3029,6 +3128,7 @@ U-47700;U-48800
             <div class="sz-fv iss">${escapeHtml(ch.issue || '—')}</div>
             ${egrulBlock}
             ${block152}
+            ${blockCookie}
             ${block149}
             ${blockERIR}
             ${blockOffer}
@@ -3046,6 +3146,23 @@ U-47700;U-48800
           </div>
         </div>
       </div>`;
+  }
+
+  function renderCookieBlock(r) {
+    if (!r) return '';
+    const cls = r.status === 'ok' ? 'good' : r.status === 'risk' ? 'warn' : 'bad';
+    const icon = r.status === 'ok' ? '✓' : r.status === 'risk' ? '⚠' : '✗';
+    const trackDot = r.hasTracking ? '🔴' : '⚪';
+    const bannerDot = r.hasCookieBanner ? '🟢' : '⚪';
+    return `<div class="sz-egrul-block ${cls}">
+      <div class="sz-egrul-title">${icon} Cookie-compliance — ${escapeHtml(r.title)}</div>
+      <div class="sz-152-list">
+        <div class="sz-152-row"><span class="sz-152-icon ${r.hasTracking ? 'miss' : 'ok'}">${trackDot}</span><span class="sz-152-label">Аналитический трекинг: ${r.hasTracking ? 'обнаружен (Метрика / GA / Pixel)' : 'не обнаружен'}</span></div>
+        <div class="sz-152-row"><span class="sz-152-icon ${r.hasCookieBanner ? 'ok' : 'miss'}">${bannerDot}</span><span class="sz-152-label">Cookie-баннер: ${r.hasCookieBanner ? 'присутствует' : 'отсутствует'}</span></div>
+        <div class="sz-152-row"><span class="sz-152-icon ${r.policyHasCookies ? 'ok' : 'miss'}">${r.policyHasCookies ? '✓' : '✗'}</span><span class="sz-152-label">Cookies упоминаются в политике: ${r.policyHasCookies ? 'да' : 'нет'}</span></div>
+      </div>
+      <div class="sz-egrul-desc">${escapeHtml(r.message)}</div>
+    </div>`;
   }
 
   function render152Block(r) {
