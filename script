@@ -1744,8 +1744,13 @@ U-47700;U-48800
     const seen = new Set();
     const uniqueLinks = links.filter(l => seen.has(l.href) ? false : (seen.add(l.href), true));
 
+    // Маркеры для классификации ссылок в навигации/футере.
+    // Удалены жадные коротыши:
+    //   'пд'    → матчился внутри "подкаст", "командировка", "подобн"
+    //   'данных' → матчился в "база данных", "управление данных"
+    // Оставлены либо длинные стемы, либо URL-фрагменты.
     const KW = {
-      policy: ['политик','конфиденц','персональн','privacy','cookie','данных','gdpr','обработк','согласие','пд','personal-data','persdata','privacy-policy','/policy'],
+      policy: ['политик','конфиденц','персональн','privacy','cookie','gdpr','согласие','обработки данн','persdata','personal-data','privacy-policy','/policy','/policies'],
       offer:  ['оферт','договор','правила','усло','public-offer','соглашен','agreement','terms'],
       ret:    ['возврат','обмен','отказ'],
       about:  ['о компани','о нас','контакт','about','contact','реквизит']
@@ -2452,7 +2457,7 @@ U-47700;U-48800
             if (updated.found >= 6) updated.status = 'ok';
             else if (updated.found >= 3) updated.status = 'risk';
             else updated.status = 'violation';
-            updated.aiVerified = true;
+            // per-item flag confirmedBy='ai' уже выставлен выше → UI этого достаточно
             resolve(updated);
           } catch (e) {
             resolve(result152); // fail-safe
@@ -2686,13 +2691,15 @@ U-47700;U-48800
   };
 
   // Заглушки для 5 AI-законов — рендерятся всегда, даже если Groq недоступен.
-  // Локальные переопределения (152-ФЗ от check152FZ, 149-ФЗ от ЕГРЮЛ) применяются поверх.
+  // Каждая запись имеет ЯВНЫЙ id — используется для сопоставления с локальными
+  // чекерами и render-блоками. Раньше использовали substring matching по law_code
+  // (ch.law_code.includes('152-ФЗ')) — было хрупко при пересекающихся кодах.
   const AI_LAW_STUBS = [
-    { law: 'Упоминание наркотиков',             law_code: 'ст.6.13 КоАП, ФЗ №3',         fine: 'до 1 500 000 руб.',        status: 'unknown', issue: '', location: '', found_text: '', action: '' },
-    { law: '152-ФЗ — персональные данные',       law_code: '152-ФЗ, ст.13.11 КоАП',       fine: 'до 300 000 руб.',           status: 'unknown', issue: '', location: '', found_text: '', action: '' },
-    { law: 'Маркировка рекламы (ЕРИР)',          law_code: 'ФЗ №347, ст.14.3 КоАП',       fine: '100 000 — 500 000 руб.',    status: 'unknown', issue: '', location: '', found_text: '', action: '' },
-    { law: '149-ФЗ — информация о владельце',    law_code: '149-ФЗ ст.10, ст.13.31 КоАП', fine: 'до 100 000 руб.',           status: 'unknown', issue: '', location: '', found_text: '', action: '' },
-    { law: 'Публичная оферта и условия возврата',law_code: 'ГК РФ ст.435, ЗоЗПП ст.26.1', fine: 'до 500 000 руб.',           status: 'unknown', issue: '', location: '', found_text: '', action: '' },
+    { id: 'drugs',  law: 'Упоминание наркотиков',             law_code: 'ст.6.13 КоАП, ФЗ №3',         fine: 'до 1 500 000 руб.',        status: 'unknown', issue: '', location: '', found_text: '', action: '' },
+    { id: 'law152', law: '152-ФЗ — персональные данные',       law_code: '152-ФЗ, ст.13.11 КоАП',       fine: 'до 300 000 руб.',           status: 'unknown', issue: '', location: '', found_text: '', action: '' },
+    { id: 'erir',   law: 'Маркировка рекламы (ЕРИР)',          law_code: 'ФЗ №347, ст.14.3 КоАП',       fine: '100 000 — 500 000 руб.',    status: 'unknown', issue: '', location: '', found_text: '', action: '' },
+    { id: 'law149', law: '149-ФЗ — информация о владельце',    law_code: '149-ФЗ ст.10, ст.13.31 КоАП', fine: 'до 100 000 руб.',           status: 'unknown', issue: '', location: '', found_text: '', action: '' },
+    { id: 'offer',  law: 'Публичная оферта и условия возврата',law_code: 'ГК РФ ст.435, ЗоЗПП ст.26.1', fine: 'до 500 000 руб.',           status: 'unknown', issue: '', location: '', found_text: '', action: '' },
   ];
 
   // Текстовые шаблоны issue/action по каждому закону на основе локальных результатов.
@@ -2701,7 +2708,7 @@ U-47700;U-48800
     const out = AI_LAW_STUBS.map(s => ({ ...s }));
 
     // 1) Наркотики
-    const drugs = out.find(c => c.law_code.includes('ст.6.13'));
+    const drugs = out.find(c => c.id === 'drugs');
     if (drugs && resultDrugs) {
       drugs.status = resultDrugs.status;
       if (!resultDrugs.hasMentions) {
@@ -2721,7 +2728,7 @@ U-47700;U-48800
     }
 
     // 2) 152-ФЗ + Cookie compliance
-    const law152 = out.find(c => c.law_code.includes('152-ФЗ'));
+    const law152 = out.find(c => c.id === 'law152');
     if (law152 && result152) {
       law152.status = result152.status === 'no_policy' ? 'violation' : result152.status;
       // Cookie может ужесточить статус: policy ok + cookie violation → risk
@@ -2753,7 +2760,7 @@ U-47700;U-48800
     }
 
     // 3) ЕРИР
-    const erir = out.find(c => c.law_code.includes('ФЗ №347'));
+    const erir = out.find(c => c.id === 'erir');
     if (erir && resultERIR) {
       erir.status = resultERIR.status;
       if (!resultERIR.hasAdContent) {
@@ -2772,7 +2779,7 @@ U-47700;U-48800
     }
 
     // 4) 149-ФЗ
-    const law149 = out.find(c => c.law_code.includes('149-ФЗ'));
+    const law149 = out.find(c => c.id === 'law149');
     if (law149 && result149) {
       const egrulInactive = egrul?.result?.parsed && egrul.result.parsed.isActive === false;
       law149.status = egrulInactive ? 'violation' : result149.status;
@@ -2790,7 +2797,7 @@ U-47700;U-48800
     }
 
     // 5) Оферта
-    const offer = out.find(c => c.law_code.includes('ст.435'));
+    const offer = out.find(c => c.id === 'offer');
     if (offer && resultOffer) {
       offer.status = resultOffer.status;
       const kindHuman = resultOffer.kind === 'saas' ? 'SaaS / лицензионный договор' :
@@ -2935,7 +2942,15 @@ U-47700;U-48800
       <div class="sz-checks">
         ${renderSlezaCheck(inoItems, 'Маркировка иноагентов', 'ФЗ №121, №255-ФЗ', '40 000 — 500 000 руб.', pages, 'inoagent')}
         ${renderSlezaCheck(extItems, 'Маркировка экстремистов / террористов', 'ст.13.15 КоАП, ФЗ №114', 'до 500 000 руб.', pages, 'extremist')}
-        ${aiChecks.map((ch, i) => renderAICheck(ch, i, egrul, aiData?.result152, aiData?.result149, aiData?.resultERIR, aiData?.resultOffer, aiData?.resultDrugs, aiData?.resultCookie)).join('')}
+        ${aiChecks.map((ch, i) => renderAICheck(ch, i, {
+          egrul,
+          result152:   aiData?.result152,
+          result149:   aiData?.result149,
+          resultERIR:  aiData?.resultERIR,
+          resultOffer: aiData?.resultOffer,
+          resultDrugs: aiData?.resultDrugs,
+          resultCookie: aiData?.resultCookie,
+        })).join('')}
       </div>
 
       <div class="sz-cta">
@@ -3076,50 +3091,26 @@ U-47700;U-48800
     return many;
   }
 
-  function renderAICheck(ch, i, egrul, result152, result149, resultERIR, resultOffer, resultDrugs, resultCookie) {
-    const st = ST[ch.status] || ST.unknown;
+  // Каждая карточка чек-листа рендерится только в карточке СВОЕГО закона
+  // (определяется по explicit `id` в AI_LAW_STUBS, не substring matching).
+  function renderAICheck(ch, i, ctx) {
+    // ctx = { egrul, result152, result149, resultERIR, resultOffer, resultDrugs, resultCookie }
+    const { egrul, result152, result149, resultERIR, resultOffer, resultDrugs, resultCookie } = ctx || {};
     const showLoc = ch.status !== 'ok' && ch.status !== 'unknown' && ch.found_text && !ch.found_text.toLowerCase().includes('отсутств');
     const showQuote = ch.found_text && !ch.found_text.toLowerCase().includes('отсутств') && ch.status !== 'ok';
 
     // Блок верификации ЕГРЮЛ — только для 149-ФЗ
-    let egrulBlock = '';
-    if (egrul && egrul.checked && (ch.law_code || '').includes('149-ФЗ')) {
-      egrulBlock = renderEgrulBlock(egrul);
-    }
+    const egrulBlock = (egrul && egrul.checked && ch.id === 'law149') ? renderEgrulBlock(egrul) : '';
 
-    // Блок чек-листа 152-ФЗ + блок Cookie compliance (тоже в 152-ФЗ карточке)
-    let block152 = '';
-    let blockCookie = '';
-    if (result152 && (ch.law_code || '').includes('152-ФЗ')) {
-      block152 = render152Block(result152);
-      if (resultCookie) blockCookie = renderCookieBlock(resultCookie);
-    }
+    // Чек-листы по id — каждый закон рендерится только в своей карточке
+    const block152    = (ch.id === 'law152' && result152)   ? render152Block(result152)   : '';
+    const blockCookie = (ch.id === 'law152' && resultCookie) ? renderCookieBlock(resultCookie) : '';
+    const block149    = (ch.id === 'law149' && result149)   ? render149Block(result149)   : '';
+    const blockERIR   = (ch.id === 'erir'   && resultERIR)  ? renderERIRBlock(resultERIR) : '';
+    const blockOffer  = (ch.id === 'offer'  && resultOffer) ? renderOfferBlock(resultOffer) : '';
+    const blockDrugs  = (ch.id === 'drugs'  && resultDrugs) ? renderDrugsBlock(resultDrugs) : '';
 
-    // Блок чек-листа 149-ФЗ
-    let block149 = '';
-    if (result149 && (ch.law_code || '').includes('149-ФЗ')) {
-      block149 = render149Block(result149);
-    }
-
-    // Блок чек-листа ЕРИР
-    let blockERIR = '';
-    if (resultERIR && (ch.law_code || '').includes('ФЗ №347')) {
-      blockERIR = renderERIRBlock(resultERIR);
-    }
-
-    // Блок чек-листа оферты
-    let blockOffer = '';
-    if (resultOffer && (ch.law_code || '').includes('ст.435')) {
-      blockOffer = renderOfferBlock(resultOffer);
-    }
-
-    // Блок чек-листа наркотиков
-    let blockDrugs = '';
-    if (resultDrugs && (ch.law_code || '').includes('ст.6.13')) {
-      blockDrugs = renderDrugsBlock(resultDrugs);
-    }
-
-    // Если есть локальный чек — переопределяем статус карточки
+    // Переопределение статуса локальным результатом
     let effectiveStatus = ch.status;
     let effectiveLabel = ST[ch.status]?.label || 'НЕТ ДАННЫХ';
     let effectiveCls = ST[ch.status]?.cls || 'unknown';
@@ -3128,23 +3119,21 @@ U-47700;U-48800
       else if (localStatus === 'risk') { effectiveStatus = 'risk'; effectiveLabel = ST.risk.label; effectiveCls = ST.risk.cls; }
       else if (localStatus === 'violation' || localStatus === 'no_policy') { effectiveStatus = 'violation'; effectiveLabel = ST.violation.label; effectiveCls = ST.violation.cls; }
     };
-    if (result152 && (ch.law_code || '').includes('152-ФЗ')) {
+    if (ch.id === 'law152' && result152) {
       overrideFromLocal(result152.status);
       // Cookie-нарушение может ужесточить статус 152-ФЗ (но не ослабить)
-      if (resultCookie && resultCookie.status === 'violation' && effectiveStatus === 'ok') {
-        overrideFromLocal('risk'); // policy ok, но cookie нарушен → risk
-      } else if (resultCookie && resultCookie.status === 'risk' && effectiveStatus === 'ok') {
+      if (resultCookie && (resultCookie.status === 'violation' || resultCookie.status === 'risk') && effectiveStatus === 'ok') {
         overrideFromLocal('risk');
       }
     }
-    if (result149 && (ch.law_code || '').includes('149-ФЗ')) {
+    if (ch.id === 'law149' && result149) {
       // ЕГРЮЛ может ужесточить статус: организация прекращена → нарушение независимо от чек-листа
       const egrulInactive = egrul?.result?.parsed && egrul.result.parsed.isActive === false;
       overrideFromLocal(egrulInactive ? 'violation' : result149.status);
     }
-    if (resultERIR  && (ch.law_code || '').includes('ФЗ №347')) overrideFromLocal(resultERIR.status);
-    if (resultOffer && (ch.law_code || '').includes('ст.435'))  overrideFromLocal(resultOffer.status);
-    if (resultDrugs && (ch.law_code || '').includes('ст.6.13')) overrideFromLocal(resultDrugs.status);
+    if (ch.id === 'erir'  && resultERIR)  overrideFromLocal(resultERIR.status);
+    if (ch.id === 'offer' && resultOffer) overrideFromLocal(resultOffer.status);
+    if (ch.id === 'drugs' && resultDrugs) overrideFromLocal(resultDrugs.status);
 
     const hasLocalCheck = block152 || block149 || blockERIR || blockOffer || blockDrugs || blockCookie;
 
@@ -3183,49 +3172,72 @@ U-47700;U-48800
       </div>`;
   }
 
+  // Общая оболочка для всех чек-листов (152-ФЗ, 149-ФЗ, ЕРИР, Оферта, Наркотики, Cookie).
+  // status → cls/icon, title и desc передаются как готовые строки, itemsHtml — заранее
+  // отрендеренные строки с <div class="sz-152-row">. Это убирает ~6 одинаковых
+  // оболочек по 8-10 строк каждая.
+  function renderChecklistShell({ status, title, itemsHtml, desc, titlePrefix }) {
+    const cls = status === 'ok' ? 'good' : status === 'risk' ? 'warn' : status === 'no_policy' ? 'bad' : 'bad';
+    const icon = status === 'ok' ? '✓' : status === 'risk' ? '⚠' : '✗';
+    const prefix = titlePrefix ? `${titlePrefix} — ` : '';
+    return `<div class="sz-egrul-block ${cls}">
+      <div class="sz-egrul-title">${icon} ${prefix}${escapeHtml(title)}</div>
+      ${itemsHtml ? `<div class="sz-152-list">${itemsHtml}</div>` : ''}
+      <div class="sz-egrul-desc">${desc}</div>
+    </div>`;
+  }
+  // Простая строка чек-листа: галочка/крестик + лейбл. Используется большинством блоков.
+  function checklistRow({ present, label, extra }) {
+    const iconChar = present ? '✓' : '✗';
+    const iconCls = present ? 'ok' : 'miss';
+    return `<div class="sz-152-row">
+        <span class="sz-152-icon ${iconCls}">${iconChar}</span>
+        <span class="sz-152-label ${present ? '' : 'miss'}">${escapeHtml(label)}${extra || ''}</span>
+      </div>`;
+  }
+
   function renderCookieBlock(r) {
     if (!r) return '';
-    const cls = r.status === 'ok' ? 'good' : r.status === 'risk' ? 'warn' : 'bad';
-    const icon = r.status === 'ok' ? '✓' : r.status === 'risk' ? '⚠' : '✗';
     const trackDot = r.hasTracking ? '🔴' : '⚪';
     const bannerDot = r.hasCookieBanner ? '🟢' : '⚪';
-    return `<div class="sz-egrul-block ${cls}">
-      <div class="sz-egrul-title">${icon} Cookie-compliance — ${escapeHtml(r.title)}</div>
-      <div class="sz-152-list">
-        <div class="sz-152-row"><span class="sz-152-icon ${r.hasTracking ? 'miss' : 'ok'}">${trackDot}</span><span class="sz-152-label">Аналитический трекинг: ${r.hasTracking ? 'обнаружен (Метрика / GA / Pixel)' : 'не обнаружен'}</span></div>
-        <div class="sz-152-row"><span class="sz-152-icon ${r.hasCookieBanner ? 'ok' : 'miss'}">${bannerDot}</span><span class="sz-152-label">Cookie-баннер: ${r.hasCookieBanner ? 'присутствует' : 'отсутствует'}</span></div>
-        <div class="sz-152-row"><span class="sz-152-icon ${r.policyHasCookies ? 'ok' : 'miss'}">${r.policyHasCookies ? '✓' : '✗'}</span><span class="sz-152-label">Cookies упоминаются в политике: ${r.policyHasCookies ? 'да' : 'нет'}</span></div>
-      </div>
-      <div class="sz-egrul-desc">${escapeHtml(r.message)}</div>
-    </div>`;
+    const itemsHtml = [
+      `<div class="sz-152-row"><span class="sz-152-icon ${r.hasTracking ? 'miss' : 'ok'}">${trackDot}</span><span class="sz-152-label">Аналитический трекинг: ${r.hasTracking ? 'обнаружен (Метрика / GA / Pixel)' : 'не обнаружен'}</span></div>`,
+      `<div class="sz-152-row"><span class="sz-152-icon ${r.hasCookieBanner ? 'ok' : 'miss'}">${bannerDot}</span><span class="sz-152-label">Cookie-баннер: ${r.hasCookieBanner ? 'присутствует' : 'отсутствует'}</span></div>`,
+      `<div class="sz-152-row"><span class="sz-152-icon ${r.policyHasCookies ? 'ok' : 'miss'}">${r.policyHasCookies ? '✓' : '✗'}</span><span class="sz-152-label">Cookies упоминаются в политике: ${r.policyHasCookies ? 'да' : 'нет'}</span></div>`,
+    ].join('');
+    return renderChecklistShell({
+      status: r.status,
+      titlePrefix: 'Cookie-compliance',
+      title: r.title,
+      itemsHtml,
+      desc: escapeHtml(r.message),
+    });
   }
 
   function render152Block(r) {
     // Политика не найдена
     if (r.status === 'no_policy') {
-      return `<div class="sz-egrul-block bad">
-        <div class="sz-egrul-title">⚠ Политика конфиденциальности НЕ НАЙДЕНА</div>
-        <div class="sz-egrul-desc">По 152-ФЗ оператор обязан опубликовать политику конфиденциальности с 7 обязательными пунктами (ст. 18.1).</div>
-      </div>`;
+      return renderChecklistShell({
+        status: 'no_policy',
+        title: 'Политика конфиденциальности НЕ НАЙДЕНА',
+        itemsHtml: '',
+        desc: 'По 152-ФЗ оператор обязан опубликовать политику конфиденциальности с 7 обязательными пунктами (ст. 18.1).',
+      });
     }
-
-    const cls = r.status === 'ok' ? 'good' : r.status === 'risk' ? 'warn' : 'bad';
-    const icon = r.status === 'ok' ? '✓' : r.status === 'risk' ? '⚠' : '✗';
     const title = r.status === 'ok' ? `Политика полная (${r.found} из ${r.total})` :
                   r.status === 'risk' ? `Политика неполная (${r.found} из ${r.total})` :
                   `Критические пробелы (${r.found} из ${r.total})`;
-
-    const items = r.items.map(item => {
+    const itemsHtml = r.items.map(item => {
       const isAi = item.present && item.confirmedBy === 'ai';
       const iconChar = item.present ? (isAi ? '◆' : '✓') : '✗';
       const iconCls = item.present ? (isAi ? 'ai' : 'ok') : 'miss';
       const titleAttr = isAi && item.quote ? ` title="Подтверждено AI: «${escapeHtml(item.quote)}»"` : '';
+      const aiTag = isAi ? ' <span style="font-family:\'Courier New\',monospace;font-size:9px;color:#60a5fa">· AI</span>' : '';
       return `<div class="sz-152-row"${titleAttr}>
         <span class="sz-152-icon ${iconCls}">${iconChar}</span>
-        <span class="sz-152-label ${item.present ? '' : 'miss'}">${escapeHtml(item.label)}${isAi ? ' <span style="font-family:\'Courier New\',monospace;font-size:9px;color:#60a5fa">· AI</span>' : ''}</span>
+        <span class="sz-152-label ${item.present ? '' : 'miss'}">${escapeHtml(item.label)}${aiTag}</span>
       </div>`;
     }).join('');
-
     const missingItems = r.items.filter(i => !i.present);
     const aiCount = r.items.filter(i => i.present && i.confirmedBy === 'ai').length;
     let desc;
@@ -3236,146 +3248,92 @@ U-47700;U-48800
     } else {
       desc = 'Политика содержит все обязательные пункты по ст. 18.1 152-ФЗ.';
     }
-
-    return `<div class="sz-egrul-block ${cls}">
-      <div class="sz-egrul-title">${icon} ${title}</div>
-      <div class="sz-152-list">${items}</div>
-      <div class="sz-egrul-desc">${desc}</div>
-    </div>`;
+    return renderChecklistShell({ status: r.status, title, itemsHtml, desc });
   }
 
   function render149Block(r) {
-    const cls = r.status === 'ok' ? 'good' : r.status === 'risk' ? 'warn' : 'bad';
-    const icon = r.status === 'ok' ? '✓' : r.status === 'risk' ? '⚠' : '✗';
     const title = r.status === 'ok' ? `Реквизиты полные (${r.found} из ${r.total})` :
                   r.status === 'risk' ? `Реквизиты неполные (${r.found} из ${r.total})` :
                   `Критические пробелы (${r.found} из ${r.total})`;
-
-    const items = r.items.map(item => {
-      const iconChar = item.present ? '✓' : '✗';
-      const iconCls = item.present ? 'ok' : 'miss';
-      return `<div class="sz-152-row">
-        <span class="sz-152-icon ${iconCls}">${iconChar}</span>
-        <span class="sz-152-label ${item.present ? '' : 'miss'}">${escapeHtml(item.label)}</span>
-      </div>`;
-    }).join('');
-
+    const itemsHtml = r.items.map(item => checklistRow({ present: item.present, label: item.label })).join('');
     const missing = r.items.filter(i => !i.present);
     const desc = missing.length > 0
       ? `Отсутствует на сайте: ${escapeHtml(missing.map(i => i.label.toLowerCase()).join('; '))}.`
       : 'Все обязательные реквизиты владельца указаны на сайте.';
-
-    return `<div class="sz-egrul-block ${cls}">
-      <div class="sz-egrul-title">${icon} ${title}</div>
-      <div class="sz-152-list">${items}</div>
-      <div class="sz-egrul-desc">${desc}</div>
-    </div>`;
+    return renderChecklistShell({ status: r.status, title, itemsHtml, desc });
   }
 
   function renderERIRBlock(r) {
-    // Не коммерческого рекламного контента нет — короткий "OK"-блок
     if (!r.hasAdContent) {
-      return `<div class="sz-egrul-block good">
-        <div class="sz-egrul-title">✓ Рекламный контент не обнаружен</div>
-        <div class="sz-egrul-desc">Сайт не содержит признаков интернет-рекламы — маркировка ЕРИР не требуется. Если реклама размещается динамически (через JS), проверка может быть неточной.</div>
-      </div>`;
+      return renderChecklistShell({
+        status: 'ok',
+        title: 'Рекламный контент не обнаружен',
+        itemsHtml: '',
+        desc: 'Сайт не содержит признаков интернет-рекламы — маркировка ЕРИР не требуется. Если реклама размещается динамически (через JS), проверка может быть неточной.',
+      });
     }
-    const cls = r.status === 'ok' ? 'good' : r.status === 'risk' ? 'warn' : 'bad';
-    const icon = r.status === 'ok' ? '✓' : r.status === 'risk' ? '⚠' : '✗';
     const title = r.status === 'ok' ? `Реклама маркирована (${r.found} из ${r.total})` :
                   r.status === 'risk' ? `Маркировка неполная (${r.found} из ${r.total})` :
                   `Реклама без маркировки (${r.found} из ${r.total})`;
-    const items = r.items.map(item => {
-      const iconChar = item.present ? '✓' : '✗';
-      const iconCls = item.present ? 'ok' : 'miss';
-      return `<div class="sz-152-row">
-        <span class="sz-152-icon ${iconCls}">${iconChar}</span>
-        <span class="sz-152-label ${item.present ? '' : 'miss'}">${escapeHtml(item.label)}</span>
-      </div>`;
-    }).join('');
+    const itemsHtml = r.items.map(item => checklistRow({ present: item.present, label: item.label })).join('');
     const missing = r.items.filter(i => !i.present);
     const desc = missing.length > 0
       ? `Отсутствует: ${escapeHtml(missing.map(i => i.label.toLowerCase()).join('; '))}. С 01.09.2022 интернет-реклама без токена ERID — штраф до 500 000 руб.`
       : 'Рекламный контент маркирован корректно: токен ERID, метка «реклама», информация о рекламодателе на месте.';
-    return `<div class="sz-egrul-block ${cls}">
-      <div class="sz-egrul-title">${icon} ${title}</div>
-      <div class="sz-152-list">${items}</div>
-      <div class="sz-egrul-desc">${desc}</div>
-    </div>`;
+    return renderChecklistShell({ status: r.status, title, itemsHtml, desc });
   }
 
   function renderOfferBlock(r) {
-    // Не торговая площадка — оферта не обязательна
     if (!r.isCommercial) {
-      return `<div class="sz-egrul-block good">
-        <div class="sz-egrul-title">✓ Информационный сайт</div>
-        <div class="sz-egrul-desc">Признаков торговой / SaaS-деятельности не обнаружено — публичная оферта и условия возврата не обязательны.</div>
-      </div>`;
+      return renderChecklistShell({
+        status: 'ok',
+        title: 'Информационный сайт',
+        itemsHtml: '',
+        desc: 'Признаков торговой / SaaS-деятельности не обнаружено — публичная оферта и условия возврата не обязательны.',
+      });
     }
     const kindLabel = r.kind === 'saas' ? 'SaaS / лицензионный договор' :
                       r.kind === 'ecommerce' ? 'E-commerce / товары' :
                       r.kind === 'services' ? 'B2B-услуги / договор подряда' :
                       'Коммерческая деятельность';
-    const cls = r.status === 'ok' ? 'good' : r.status === 'risk' ? 'warn' : 'bad';
-    const icon = r.status === 'ok' ? '✓' : r.status === 'risk' ? '⚠' : '✗';
     const title = r.status === 'ok' ? `Оферта на месте (${r.found} из ${r.total}) · ${kindLabel}` :
                   r.status === 'risk' ? `Оферта неполная (${r.found} из ${r.total}) · ${kindLabel}` :
                   `Критические пробелы (${r.found} из ${r.total})`;
-    const items = r.items.map(item => {
-      const iconChar = item.present ? '✓' : '✗';
-      const iconCls = item.present ? 'ok' : 'miss';
-      return `<div class="sz-152-row">
-        <span class="sz-152-icon ${iconCls}">${iconChar}</span>
-        <span class="sz-152-label ${item.present ? '' : 'miss'}">${escapeHtml(item.label)}</span>
-      </div>`;
-    }).join('');
+    const itemsHtml = r.items.map(item => checklistRow({ present: item.present, label: item.label })).join('');
     const missing = r.items.filter(i => !i.present);
     const desc = missing.length > 0
       ? `Отсутствует: ${escapeHtml(missing.map(i => i.label.toLowerCase()).join('; '))}. По ЗоЗПП покупатель имеет право вернуть товар в течение 7 дней — это должно быть указано на сайте.`
       : 'Все обязательные элементы публичной оферты на месте: договор, условия возврата, реквизиты продавца и контакты.';
-    return `<div class="sz-egrul-block ${cls}">
-      <div class="sz-egrul-title">${icon} ${title}</div>
-      <div class="sz-152-list">${items}</div>
-      <div class="sz-egrul-desc">${desc}</div>
-    </div>`;
+    return renderChecklistShell({ status: r.status, title, itemsHtml, desc });
   }
 
   function renderDrugsBlock(r) {
     if (!r.hasMentions) {
-      return `<div class="sz-egrul-block good">
-        <div class="sz-egrul-title">✓ Упоминаний запрещённых веществ не обнаружено</div>
-        <div class="sz-egrul-desc">Сканирование по базе из ~900 терминов (вещества, сленг, прекурсоры) не нашло совпадений.</div>
-      </div>`;
+      return renderChecklistShell({
+        status: 'ok',
+        title: 'Упоминаний запрещённых веществ не обнаружено',
+        itemsHtml: '',
+        desc: 'Сканирование по базе из ~900 терминов (вещества, сленг, прекурсоры) не нашло совпадений.',
+      });
     }
-    const cls = r.status === 'ok' ? 'good' : r.status === 'risk' ? 'warn' : 'bad';
-    const icon = r.status === 'ok' ? '✓' : r.status === 'risk' ? '⚠' : '✗';
     const title = r.status === 'ok'
       ? `Упоминания в допустимом контексте (${r.totalMentions} вхождений)`
       : r.status === 'risk'
         ? `Упоминания без контекста — ${r.withoutContext} из ${r.uniqueTerms}`
         : `Упоминания без дисклеймера — ${r.withoutContext} из ${r.uniqueTerms}`;
-
-    const items = r.mentions.map(m => {
-      const iconChar = m.hasContext ? '✓' : '✗';
-      const iconCls = m.hasContext ? 'ok' : 'miss';
+    const itemsHtml = r.mentions.map(m => {
       const note = m.hasContext ? 'в контексте (УК/медицина/новости)' : 'без явного контекста';
-      return `<div class="sz-152-row">
-        <span class="sz-152-icon ${iconCls}">${iconChar}</span>
-        <span class="sz-152-label ${m.hasContext ? '' : 'miss'}">«${escapeHtml(m.term)}» (×${m.count}) — ${note}</span>
-      </div>`;
+      return checklistRow({
+        present: m.hasContext,
+        label: `«${m.term}» (×${m.count}) — ${note}`,
+      });
     }).join('');
-
     const desc = r.status === 'ok'
       ? 'Все упоминания сопровождаются контекстом (статья УК, медицина, профилактика, новость о борьбе с наркотиками).'
       : r.status === 'risk'
         ? `Найдено ${r.withoutContext} упоминаний без явного юридического/медицинского контекста — рекомендуется добавить дисклеймер или удалить.`
         : `Найдено ${r.withoutContext} упоминаний без дисклеймера. По ст.6.13 КоАП — пропаганда наркотиков: штраф до 1 500 000 руб.`;
-
-    return `<div class="sz-egrul-block ${cls}">
-      <div class="sz-egrul-title">${icon} ${title}</div>
-      <div class="sz-152-list">${items}</div>
-      <div class="sz-egrul-desc">${desc}</div>
-    </div>`;
+    return renderChecklistShell({ status: r.status, title, itemsHtml, desc });
   }
 
   function renderEgrulBlock(egrul) {
