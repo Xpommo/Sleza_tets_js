@@ -1219,21 +1219,27 @@ U-47700;U-48800
     // Сортируем по убыванию длины — длинные термины должны матчиться раньше коротких
     _drugTermsList.sort((a, b) => b.length - a.length);
     const escaped = _drugTermsList.map(t => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
-    // Cyrillic-aware границы слова: до и после термина должен быть не-буквенно-цифровой символ
+    // Cyrillic-aware: строгая граница СПЕРЕДИ (защита от false-positive типа "копий"→"опий"),
+    // НО без границы сзади — иначе теряем формы "кокаина", "героином", "марихуаны" и т.п.
+    // Расчёт: терминов <3 символов нет (отфильтрованы), длинные термины идут первыми
+    // в альтернации (longest-match), морфологические окончания добавляются естественно.
     _drugRegex = new RegExp(
-      '(?:^|[^а-яёa-z0-9_])(' + escaped.join('|') + ')(?=[^а-яёa-z0-9_]|$)',
+      '(?:^|[^а-яёa-z0-9_])(' + escaped.join('|') + ')',
       'gi'
     );
+    try { console.log('[Слеза] Drug regex скомпилирован,', _drugTermsList.length, 'уникальных терминов'); } catch(_) {}
     return { re: _drugRegex, terms: _drugTermsList };
   }
 
   function checkDrugs(fullText) {
     if (!fullText || fullText.length < 100) {
+      try { console.log('[Слеза] checkDrugs: текст слишком короткий', fullText?.length || 0); } catch(_) {}
       return { hasMentions: false, status: 'ok', mentions: [], totalMentions: 0, withContext: 0, withoutContext: 0 };
     }
     const { re } = getDrugRegex();
     re.lastIndex = 0; // важно: re глобальный, сбрасываем перед matchAll
     const matches = [...fullText.matchAll(re)];
+    try { console.log('[Слеза] checkDrugs: текст', fullText.length, 'симв., совпадений', matches.length); } catch(_) {}
     if (matches.length === 0) {
       return { hasMentions: false, status: 'ok', mentions: [], totalMentions: 0, withContext: 0, withoutContext: 0 };
     }
