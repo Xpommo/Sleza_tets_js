@@ -122,10 +122,25 @@
       }
     }
 
-    // (2) Звёздочка после имени + сноска
+    // (2) Звёздочка после имени + сноска ИМЕННО В ХВОСТЕ документа.
+    // Раньше сноска искалась во всём тексте → ложные срабатывания: чужая звёздочка
+    // у одного имени + чужая сноска у другого → оба ошибочно "промаркированы".
+    // Теперь требуем: (а) имя + звёздочка существует, (б) сноска ИЛИ в последних
+    // 2000 симв. документа, ИЛИ упоминает фамилию из этого имени.
     const starAfter = new RegExp(escapeRegex(name) + '\\s{0,3}[\\*✱⁕＊]+', 'i');
-    if (starAfter.test(text) && STAR_FOOTNOTE_RE.test(text)) {
-      return { found: true, hasMarking: true, via: 'asterisk', context: firstContext };
+    if (starAfter.test(text)) {
+      // Берём последнее слово из имени как «фамилию» (для большинства ФИО это работает)
+      const nameParts = name.trim().split(/\s+/);
+      const surname = nameParts[nameParts.length - 1];
+      const tailForFootnote = text.slice(Math.max(0, text.length - 2000));
+      const footnoteInTail = STAR_FOOTNOTE_RE.test(tailForFootnote);
+      // Сноска упоминает фамилию (в любом падеже — strip ending up to 2 chars)
+      const surnameStem = surname.length > 4 ? surname.slice(0, -2) : surname;
+      const surnameInFootnote = surnameStem.length >= 3 &&
+        new RegExp(escapeRegex(surnameStem) + '[а-яё]{0,3}[^а-яё]', 'i').test(tailForFootnote);
+      if (footnoteInTail || surnameInFootnote) {
+        return { found: true, hasMarking: true, via: 'asterisk', context: firstContext };
+      }
     }
 
     // (3) Хвост: имя + маркировка в последних 3000 симв., в окне ±250 друг от друга
@@ -302,15 +317,18 @@
     const t = policyText.toLowerCase();
 
     // Section-aware первый проход: заголовки разделов гарантируют пункт.
-    // Ищем "1. Категории...", "2.1 Цели...", "Раздел 5. Права субъекта" и т.п.
+    // Якорь — НАЧАЛО СТРОКИ (^|\n), затем опциональный префикс "1." / "Раздел 5."
+    // Без правильного якоря (?:^|\n) альтернатива \d+\.\s* матчила любую "5." внутри
+    // абзаца, превращая section-aware в "найди где угодно после цифры".
+    const HEAD = '(?:^|\\n)\\s*(?:\\d+(?:\\.\\d+)*[\\.\\s]+|раздел\\s+\\d+[\\.\\s]+|#{1,6}\\s+)?';
     const sectionHeadingHits = {
-      categories:     /(?:^|\n|\d+\.\s*|раздел\s+\d+[\.\s]+)[^.\n]{0,30}категори[ийяю][^.\n]{0,40}(перс|субъект|данн|обрабатыва)/i,
-      purposes:       /(?:^|\n|\d+\.\s*|раздел\s+\d+[\.\s]+)[^.\n]{0,30}цел[ьеияю][^.\n]{0,40}(обработк|сбор|использ)/i,
-      legal_basis:    /(?:^|\n|\d+\.\s*|раздел\s+\d+[\.\s]+)[^.\n]{0,30}(правов[ыоае]+\s+основан|основани[яею]\s+обработ|основан[ияе]\s+для\s+обработ)/i,
-      storage_term:   /(?:^|\n|\d+\.\s*|раздел\s+\d+[\.\s]+)[^.\n]{0,30}срок[аи]?\s+(хранен|обработк|обрабатыва)/i,
-      subject_rights: /(?:^|\n|\d+\.\s*|раздел\s+\d+[\.\s]+)[^.\n]{0,30}прав[аоеыхими]+\s+субъект/i,
-      contact:        /(?:^|\n|\d+\.\s*|раздел\s+\d+[\.\s]+)[^.\n]{0,30}(контакт|реквизит|связ[аь]|обратн[аоы][яе])/i,
-      third_parties:  /(?:^|\n|\d+\.\s*|раздел\s+\d+[\.\s]+)[^.\n]{0,30}(передач[аеиу]\s+(данн|перс)|треть[ьиим]+\s+лиц)/i,
+      categories:     new RegExp(HEAD + '[^.\\n]{0,30}категори[ийяю][^.\\n]{0,40}(перс|субъект|данн|обрабатыва)', 'i'),
+      purposes:       new RegExp(HEAD + '[^.\\n]{0,30}цел[ьеияю][^.\\n]{0,40}(обработк|сбор|использ)', 'i'),
+      legal_basis:    new RegExp(HEAD + '[^.\\n]{0,30}(правов[ыоае]+\\s+основан|основани[яею]\\s+обработ|основан[ияе]\\s+для\\s+обработ)', 'i'),
+      storage_term:   new RegExp(HEAD + '[^.\\n]{0,30}срок[аи]?\\s+(хранен|обработк|обрабатыва)', 'i'),
+      subject_rights: new RegExp(HEAD + '[^.\\n]{0,30}прав[аоеыхими]+\\s+субъект', 'i'),
+      contact:        new RegExp(HEAD + '[^.\\n]{0,30}(контакт|реквизит|связ[аь]|обратн[аоы][яе])', 'i'),
+      third_parties:  new RegExp(HEAD + '[^.\\n]{0,30}(передач[аеиу]\\s+(данн|перс)|треть[ьиим]+\\s+лиц)', 'i'),
     };
 
     const checks = [
@@ -649,16 +667,20 @@
     // 1) Признаки коммерческого сайта — два независимых пула:
     //    e-commerce (товары, доставка, корзина) и SaaS/услуги (лицензия, тариф, подписка).
     //    Считаем коммерческим если в ЛЮБОМ пуле ≥2 совпадения.
+    // Cyrillic-aware границы слов: `\b` в JS работает только с латиницей/цифрами.
+    // Для русских терминов используем lookaround на не-буквенно-цифровой символ.
+    const BOUND = '(?:^|[^а-яёa-z0-9_])';
+    const ENDB  = '(?=[^а-яёa-z0-9_]|$)';
     const ecommerceMarkers = [
-      /\b(купить|заказать|оформить\s+заказ|добавить\s+в\s+корзину)\b/i,
-      /\bкорзин[аеуыой]\b/i,
-      /\b(стоимость|цена|руб(\.|лей)?|₽)\b.{0,50}(\d{2,})/i,
-      /\b(доставка|самовывоз|курьер|пункт\s+выдач|постамат)\b/i,
+      new RegExp(BOUND + '(купить|заказать|оформить\\s+заказ|добавить\\s+в\\s+корзину)' + ENDB, 'i'),
+      new RegExp(BOUND + 'корзин[аеуыой]' + ENDB, 'i'),
+      new RegExp(BOUND + '(стоимость|цена|руб(?:\\.|лей)?|₽)' + ENDB + '.{0,50}(\\d{2,})', 'i'),
+      new RegExp(BOUND + '(доставка|самовывоз|курьер|пункт\\s+выдач|постамат)' + ENDB, 'i'),
       /(\d+[\s\-]*₽|\d+[\s\-]*руб)/i,
-      /\b(оплат[аеу]|оплачивать)\b/i,
+      new RegExp(BOUND + '(оплат[аеу]|оплачивать)' + ENDB, 'i'),
       /интернет[\-\s]?магазин/i,
       /онлайн[\-\s]?(магазин|шоп|маркет)/i,
-      /\b(покупател[ьяюие]+|продавц[аеуо]+)\b/i,
+      new RegExp(BOUND + '(покупател[ьяюие]+|продавц[аеуо]+)' + ENDB, 'i'),
       /(каталог\s+товар|ассортимент\s+товар)/i,
     ];
     const saasMarkers = [
@@ -667,14 +689,14 @@
       /лицензионн[ыоаеми]+\s+(договор|соглашен|вознагражден|плат)/i,
       /программн[оаеыми]+\s+обеспечен/i,
       /(подписк|тариф|абонементн)[а-яё]+\s+(плат|стоимост|период|оплат)/i,
-      /\b(тариф|подписка|абонемент)[а-яё]*\b/i,
+      new RegExp(BOUND + '(тариф|подписка|абонемент)[а-яё]*' + ENDB, 'i'),
       /личн[ыоом]+\s+кабинет/i,
       /(SaaS|сервис|услуг[аеи]+).{0,30}(оплат|стоимост|тариф|подписк)/i,
     ];
     // B2B-сервисы / рекламные агентства / любые договоры подряда — третий тип
     const servicesMarkers = [
-      /\b(исполнител[ьяюуео]+)\b/i,
-      /\b(заказчик[аеуо]*)\b/i,
+      new RegExp(BOUND + 'исполнител[ьяюуео]+' + ENDB, 'i'),
+      new RegExp(BOUND + 'заказчик[аеуо]*' + ENDB, 'i'),
       /(оказан|оказыва|выполнен|выполня)[а-яё]+\s+(услуг|работ)/i,
       /акт\s+(сдач[ие]|приёмки|приемки|выполненн)/i,
       /технич[а-яё]+\s+задани/i,
@@ -1354,11 +1376,15 @@ U-47700;U-48800
       return { hasMentions: false, status: 'ok', mentions: [], totalMentions: 0, withContext: 0, withoutContext: 0 };
     }
 
-    // Группируем по термину (учитываем все вхождения)
+    // Группируем по термину (учитываем все вхождения).
+    // m[0] = (опциональный leading-boundary char) + m[1]. Captured group всегда в конце,
+    // поэтому позиция термина = m.index + (m[0].length - m[1].length).
+    // indexOf не подходит — он case-sensitive, а regex с флагом /i может вернуть "Героин",
+    // что вызовет indexOf("героин") = -1 и смещение на -1.
     const grouped = new Map();
     for (const m of matches) {
       const term = m[1].toLowerCase();
-      const pos = m.index + m[0].indexOf(m[1]);
+      const pos = m.index + (m[0].length - m[1].length);
       if (!grouped.has(term)) grouped.set(term, []);
       grouped.get(term).push(pos);
     }
@@ -1750,8 +1776,17 @@ U-47700;U-48800
         'script[src*="hotjar"],script[src*="mixpanel"],script[src*="amplitude"],' +
         'script[src*="roistat"],script[src*="bitrix"],script[src*="amocrm"]'
       ).length > 0 ||
-        // Также проверяем наличие inline-кода Метрики/GA в HTML
-        /(ym\s*\(\s*\d|gtag\(|fbq\(|_tmr\.push|VK\.Retargeting)/.test(document.documentElement.innerHTML.slice(0, 100000)),
+        // Inline-инициализация: смотрим только в <head> и в текстовых inline-скриптах,
+        // не пересериализуем весь DOM (на крупных новостных сайтах innerHTML = 5-15 МБ).
+        (() => {
+          const INLINE_RE = /(ym\s*\(\s*\d|gtag\(|fbq\(|_tmr\.push|VK\.Retargeting)/;
+          if (document.head && INLINE_RE.test(document.head.innerHTML)) return true;
+          const scripts = document.querySelectorAll('script:not([src])');
+          for (let i = 0; i < scripts.length && i < 50; i++) {
+            if (INLINE_RE.test(scripts[i].textContent || '')) return true;
+          }
+          return false;
+        })(),
       // Cookie-баннер: расширенная детекция
       hasCookieBanner: !!document.querySelector(
         '[class*="cookie"i],[id*="cookie"i],' +
