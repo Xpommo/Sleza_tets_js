@@ -511,6 +511,181 @@
     return result;
   }
 
+  // ── Чек-лист ЕРИР: маркировка интернет-рекламы (ФЗ №347) ──
+  // Логика:
+  // 1) Признаки рекламного контента ВООБЩЕ — есть/нет
+  // 2) Если есть — проверяем erid-токен, метку "реклама", информацию о рекламодателе
+  // Без AI: даёт предварительную оценку. С AI: вердикт уточняется.
+  function checkERIR(fullText) {
+    if (!fullText || fullText.length < 100) {
+      return { found: 0, total: 3, items: [], status: 'unknown', hasAdContent: false };
+    }
+    const t = fullText.toLowerCase();
+
+    // 1) Признаки рекламного контента
+    const adMarkers = [
+      /на\s+правах\s+реклам/,
+      /рекламн[ыоа][йея]\s+(материал|публикац|пост|пуш)/,
+      /партн[её]рск[ийояую][й]?\s+материал/,
+      /спонсорск[ийояую][й]?\s+(материал|публикац|пост|контент)/,
+      /промо\s*[\-—:]\s*материал/,
+      /рекламодател/,
+      /sponsored\s+(content|post|by)/i,
+      /\bpromo(ted)?\b/i,
+    ];
+    const hasAdContent = adMarkers.some(p => p.test(t));
+
+    const checks = [
+      {
+        id: 'erid_token',
+        label: 'Токен ERID присутствует',
+        patterns: [
+          /\berid[\s:=]+[\w\-]{6,}/i,
+          /erid[\s\-:]*[0-9a-z]{6,}/i,
+        ],
+      },
+      {
+        id: 'ad_marker',
+        label: 'Метка «реклама» / «на правах рекламы»',
+        patterns: [
+          /(?:^|[\s>])реклама(?:[\s,.:;]|$)/i,
+          /на\s+правах\s+реклам/,
+          /рекламн[ыоа][йея]\s+(материал|публикац|пост)/,
+        ],
+      },
+      {
+        id: 'advertiser_info',
+        label: 'Информация о рекламодателе (ИНН/название)',
+        patterns: [
+          /рекламодател[ьяе][\s:]+[^.\n]{5,150}/i,
+          /(?:^|[\s>])(ООО|ОАО|ЗАО|ПАО|АО|ИП)\s+[«"А-ЯЁ]/,
+          /(?:^|[\s>,.;:])ИНН[\s:№.]*[0-9]{10,12}/i,
+        ],
+      },
+    ];
+
+    const result = { items: [], found: 0, total: checks.length, status: 'unknown', hasAdContent };
+    for (const c of checks) {
+      const present = c.patterns.some(p => p.test(fullText));
+      result.items.push({ id: c.id, label: c.label, present });
+      if (present) result.found++;
+    }
+
+    // Логика статуса:
+    // - Нет рекламного контента → ok (реклама не используется, маркировка не требуется)
+    // - Есть реклама и все 3 признака → ok
+    // - Есть реклама и 2 из 3 → risk
+    // - Есть реклама и <2 → violation
+    if (!hasAdContent) {
+      result.status = 'ok';
+    } else if (result.found === 3) {
+      result.status = 'ok';
+    } else if (result.found >= 2) {
+      result.status = 'risk';
+    } else {
+      result.status = 'violation';
+    }
+
+    return result;
+  }
+
+  // ── Чек-лист публичной оферты и условий возврата (ГК РФ ст.435, ЗоЗПП ст.26.1) ──
+  // Актуально для e-commerce и любого сайта с продажей товаров/услуг.
+  // Логика:
+  // 1) Определяем — это коммерческий сайт (есть признаки торговли)?
+  // 2) Если да — проверяем наличие оферты, условий возврата, информации о продавце
+  function checkOffer(fullText, offerLinks) {
+    if (!fullText || fullText.length < 100) {
+      return { found: 0, total: 4, items: [], status: 'unknown', isCommercial: false };
+    }
+    const t = fullText.toLowerCase();
+
+    // 1) Признаки коммерческого сайта
+    const commercialMarkers = [
+      /\b(купить|заказать|оформить\s+заказ|добавить\s+в\s+корзину)\b/i,
+      /\bкорзин[аеуыой]\b/i,
+      /\b(стоимость|цена|руб(\.|лей)?|₽)\b.{0,50}(\d{2,})/i,
+      /\b(доставка|самовывоз|курьер)\b/i,
+      /(\d+[\s\-]*₽|\d+[\s\-]*руб)/i,
+      /\b(оплат[аеу]|оплачивать)\b/i,
+    ];
+    const commercialHits = commercialMarkers.filter(p => p.test(t)).length;
+    const isCommercial = commercialHits >= 2; // >=2 признаков = торговая площадка
+
+    const hasOfferLink = Array.isArray(offerLinks) && offerLinks.length > 0;
+
+    const checks = [
+      {
+        id: 'offer_exists',
+        label: 'Публичная оферта / договор присутствует',
+        patterns: [
+          /публичн[аыо][яе]\s+оферт/,
+          /\bоферт[аеуы]\b/,
+          /договор\s+(оферт|купли|присоединен|публичн)/,
+          /правила\s+(продаж|использован|сайта)/,
+          /пользовательск[оие]+\s+соглашен/,
+        ],
+        // Также засчитываем если найдена ссылка на страницу оферты
+        bonus: hasOfferLink,
+      },
+      {
+        id: 'return_policy',
+        label: 'Условия возврата товара',
+        patterns: [
+          /возврат[\s,]+товар/i,
+          /возврат\s+(денежн|средств|оплат)/i,
+          /(7|семь|14|четырнадцать)\s+(дн[яей]+|календарн|рабоч)/,
+          /отказ[\s,]+от\s+(товар|услуг)/i,
+          /обмен\s+(товар|купленн|приобрет)/i,
+          /политика\s+возврат/i,
+        ],
+      },
+      {
+        id: 'seller_info',
+        label: 'Информация о продавце (ИНН/название)',
+        patterns: [
+          /(?:^|[\s>,.;:])ИНН[\s:№.]*[0-9]{10,12}/i,
+          /(?:^|[\s>,.;:])ОГРН(?:ИП)?[\s:№.]*[0-9]{13,15}/i,
+          /(?:^|[\s>])(ООО|ОАО|ЗАО|ПАО|АО|ИП)\s+[«"А-ЯЁ]/,
+          /индивидуальный\s+предприниматель/i,
+        ],
+      },
+      {
+        id: 'contact_info',
+        label: 'Контакты продавца (email / телефон)',
+        patterns: [
+          /[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/i,
+          /(?:\+7|(?:^|\D)8)[\s\(\-]*\d{3}[\s\)\-]*\d{3}[\s\-]*\d{2}[\s\-]*\d{2}/,
+        ],
+      },
+    ];
+
+    const result = { items: [], found: 0, total: checks.length, status: 'unknown', isCommercial };
+    for (const c of checks) {
+      let present = c.patterns.some(p => p.test(fullText));
+      if (c.bonus) present = present || c.bonus;
+      result.items.push({ id: c.id, label: c.label, present });
+      if (present) result.found++;
+    }
+
+    // Логика статуса:
+    // - Не коммерческий сайт → ok (оферта не обязательна для информационных сайтов)
+    // - Коммерческий и все 4 → ok
+    // - Коммерческий и 3 из 4 → risk
+    // - Коммерческий и <3 → violation
+    if (!isCommercial) {
+      result.status = 'ok';
+    } else if (result.found === 4) {
+      result.status = 'ok';
+    } else if (result.found >= 3) {
+      result.status = 'risk';
+    } else {
+      result.status = 'violation';
+    }
+
+    return result;
+  }
+
   // Определяет, что текущая страница — SPA (React/Vue/Next.js/Angular).
   // Проверяет DOM: корневые контейнеры и путь к бандлированным скриптам.
   function detectSpaFromDom() {
@@ -1607,6 +1782,30 @@
     msg += `→ Используй этот чек-лист + результат ЕГРЮЛ выше. Не пересчитывай заново.\n`;
     msg += `═══════════════════════════════════════════\n`;
 
+    // ── Локальный чек-лист ЕРИР (ФЗ №347): маркировка интернет-рекламы ──
+    const resultERIR = checkERIR(text149);
+    msg += `\n═══ ЛОКАЛЬНЫЙ ЧЕК-ЛИСТ ЕРИР (ФЗ №347) ═══\n`;
+    msg += `Рекламный контент: ${resultERIR.hasAdContent ? 'ОБНАРУЖЕН' : 'не обнаружен'}\n`;
+    if (resultERIR.hasAdContent) {
+      resultERIR.items.forEach(item => {
+        msg += `${item.present ? '✓' : '✗'} ${item.label}\n`;
+      });
+    }
+    msg += `Локальный вывод: ${resultERIR.status === 'ok' ? (resultERIR.hasAdContent ? 'реклама маркирована корректно' : 'рекламы не обнаружено') : resultERIR.status === 'risk' ? 'есть рекламный контент, но маркировка неполная' : 'реклама без обязательной маркировки'}\n`;
+    msg += `═══════════════════════════════════════════\n`;
+
+    // ── Локальный чек-лист публичной оферты (ГК РФ ст.435, ЗоЗПП ст.26.1) ──
+    const resultOffer = checkOffer(text149, c.offerLinks || []);
+    msg += `\n═══ ЛОКАЛЬНЫЙ ЧЕК-ЛИСТ ОФЕРТЫ ═══\n`;
+    msg += `Коммерческий сайт: ${resultOffer.isCommercial ? 'ДА (есть признаки торговли)' : 'нет (информационный сайт)'}\n`;
+    if (resultOffer.isCommercial) {
+      resultOffer.items.forEach(item => {
+        msg += `${item.present ? '✓' : '✗'} ${item.label}\n`;
+      });
+    }
+    msg += `Локальный вывод: ${resultOffer.status === 'ok' ? (resultOffer.isCommercial ? 'оферта и реквизиты на месте' : 'не торговая площадка — оферта не обязательна') : resultOffer.status === 'risk' ? 'часть требований не выполнена' : 'критические пробелы (нет оферты/возврата/реквизитов)'}\n`;
+    msg += `═══════════════════════════════════════════\n`;
+
     return new Promise(resolve => {
       GM_xmlhttpRequest({
         method: 'POST',
@@ -1629,11 +1828,11 @@
             const m = txt.match(/\{[\s\S]*\}/);
             if (!m) throw new Error('parse');
             const parsed = JSON.parse(m[0]);
-            resolve({ ...parsed, fetched, result152, result149 });
-          } catch(e) { resolve({ error: e.message, fetched, result152, result149 }); }
+            resolve({ ...parsed, fetched, result152, result149, resultERIR, resultOffer });
+          } catch(e) { resolve({ error: e.message, fetched, result152, result149, resultERIR, resultOffer }); }
         },
-        onerror()   { resolve({ error: 'net',     fetched, result152, result149 }); },
-        ontimeout() { resolve({ error: 'timeout', fetched, result152, result149 }); }
+        onerror()   { resolve({ error: 'net',     fetched, result152, result149, resultERIR, resultOffer }); },
+        ontimeout() { resolve({ error: 'timeout', fetched, result152, result149, resultERIR, resultOffer }); }
       });
     });
   }
@@ -1777,7 +1976,7 @@
       <div class="sz-checks">
         ${renderSlezaCheck(inoItems, 'Маркировка иноагентов', 'ФЗ №121, №255-ФЗ', '40 000 — 500 000 руб.', pages, 'inoagent')}
         ${renderSlezaCheck(extItems, 'Маркировка экстремистов / террористов', 'ст.13.15 КоАП, ФЗ №114', 'до 500 000 руб.', pages, 'extremist')}
-        ${aiChecks.map((ch, i) => renderAICheck(ch, i, egrul, aiData?.result152, aiData?.result149)).join('')}
+        ${aiChecks.map((ch, i) => renderAICheck(ch, i, egrul, aiData?.result152, aiData?.result149, aiData?.resultERIR, aiData?.resultOffer)).join('')}
       </div>
 
       <div class="sz-cta">
@@ -1918,7 +2117,7 @@
     return many;
   }
 
-  function renderAICheck(ch, i, egrul, result152, result149) {
+  function renderAICheck(ch, i, egrul, result152, result149, resultERIR, resultOffer) {
     const st = ST[ch.status] || ST.unknown;
     const showLoc = ch.status !== 'ok' && ch.status !== 'unknown' && ch.found_text && !ch.found_text.toLowerCase().includes('отсутств');
     const showQuote = ch.found_text && !ch.found_text.toLowerCase().includes('отсутств') && ch.status !== 'ok';
@@ -1941,31 +2140,44 @@
       block149 = render149Block(result149);
     }
 
+    // Блок чек-листа ЕРИР
+    let blockERIR = '';
+    if (resultERIR && (ch.law_code || '').includes('ФЗ №347')) {
+      blockERIR = renderERIRBlock(resultERIR);
+    }
+
+    // Блок чек-листа оферты
+    let blockOffer = '';
+    if (resultOffer && (ch.law_code || '').includes('ст.435')) {
+      blockOffer = renderOfferBlock(resultOffer);
+    }
+
     // Если есть локальный чек — переопределяем статус карточки
     let effectiveStatus = ch.status;
     let effectiveLabel = ST[ch.status]?.label || 'НЕТ ДАННЫХ';
     let effectiveCls = ST[ch.status]?.cls || 'unknown';
-    if (result152 && (ch.law_code || '').includes('152-ФЗ')) {
-      if (result152.status === 'ok') { effectiveStatus = 'ok'; effectiveLabel = ST.ok.label; effectiveCls = ST.ok.cls; }
-      else if (result152.status === 'risk') { effectiveStatus = 'risk'; effectiveLabel = ST.risk.label; effectiveCls = ST.risk.cls; }
-      else if (result152.status === 'violation' || result152.status === 'no_policy') { effectiveStatus = 'violation'; effectiveLabel = ST.violation.label; effectiveCls = ST.violation.cls; }
-    }
+    const overrideFromLocal = (localStatus) => {
+      if (localStatus === 'ok') { effectiveStatus = 'ok'; effectiveLabel = ST.ok.label; effectiveCls = ST.ok.cls; }
+      else if (localStatus === 'risk') { effectiveStatus = 'risk'; effectiveLabel = ST.risk.label; effectiveCls = ST.risk.cls; }
+      else if (localStatus === 'violation' || localStatus === 'no_policy') { effectiveStatus = 'violation'; effectiveLabel = ST.violation.label; effectiveCls = ST.violation.cls; }
+    };
+    if (result152 && (ch.law_code || '').includes('152-ФЗ')) overrideFromLocal(result152.status);
     if (result149 && (ch.law_code || '').includes('149-ФЗ')) {
       // ЕГРЮЛ может ужесточить статус: организация прекращена → нарушение независимо от чек-листа
       const egrulInactive = egrul?.result?.parsed && egrul.result.parsed.isActive === false;
-      let local = result149.status;
-      if (egrulInactive) local = 'violation';
-      if (local === 'ok') { effectiveStatus = 'ok'; effectiveLabel = ST.ok.label; effectiveCls = ST.ok.cls; }
-      else if (local === 'risk') { effectiveStatus = 'risk'; effectiveLabel = ST.risk.label; effectiveCls = ST.risk.cls; }
-      else if (local === 'violation') { effectiveStatus = 'violation'; effectiveLabel = ST.violation.label; effectiveCls = ST.violation.cls; }
+      overrideFromLocal(egrulInactive ? 'violation' : result149.status);
     }
+    if (resultERIR  && (ch.law_code || '').includes('ФЗ №347')) overrideFromLocal(resultERIR.status);
+    if (resultOffer && (ch.law_code || '').includes('ст.435'))  overrideFromLocal(resultOffer.status);
+
+    const hasLocalCheck = block152 || block149 || blockERIR || blockOffer;
 
     return `
       <div class="sz-check ${effectiveCls}">
         <div class="sz-ct">
           <div>
             <div class="sz-ln">${escapeHtml(ch.law)}</div>
-            <div class="sz-lc">${escapeHtml(ch.law_code)}${egrulBlock ? ' · ЕГРЮЛ' : ''}${block152 || block149 ? ' · чек-лист' : ''}</div>
+            <div class="sz-lc">${escapeHtml(ch.law_code)}${egrulBlock ? ' · ЕГРЮЛ' : ''}${hasLocalCheck ? ' · чек-лист' : ''}</div>
           </div>
           <div class="sz-pill ${effectiveCls}">${effectiveLabel}</div>
         </div>
@@ -1976,6 +2188,8 @@
             ${egrulBlock}
             ${block152}
             ${block149}
+            ${blockERIR}
+            ${blockOffer}
             ${showLoc ? `<button class="sz-loc-btn" data-check-idx="${i}"><span class="sz-loc-icon">📍</span><span class="sz-loc-label">${escapeHtml(ch.location || 'на странице')}</span></button>` : ''}
             ${showQuote ? `<div class="sz-quote">"${escapeHtml(ch.found_text)}"</div>` : ''}
           </div>
@@ -2056,6 +2270,70 @@
       ? `Отсутствует на сайте: ${escapeHtml(missing.map(i => i.label.toLowerCase()).join('; '))}.`
       : 'Все обязательные реквизиты владельца указаны на сайте.';
 
+    return `<div class="sz-egrul-block ${cls}">
+      <div class="sz-egrul-title">${icon} ${title}</div>
+      <div class="sz-152-list">${items}</div>
+      <div class="sz-egrul-desc">${desc}</div>
+    </div>`;
+  }
+
+  function renderERIRBlock(r) {
+    // Не коммерческого рекламного контента нет — короткий "OK"-блок
+    if (!r.hasAdContent) {
+      return `<div class="sz-egrul-block good">
+        <div class="sz-egrul-title">✓ Рекламный контент не обнаружен</div>
+        <div class="sz-egrul-desc">Сайт не содержит признаков интернет-рекламы — маркировка ЕРИР не требуется. Если реклама размещается динамически (через JS), проверка может быть неточной.</div>
+      </div>`;
+    }
+    const cls = r.status === 'ok' ? 'good' : r.status === 'risk' ? 'warn' : 'bad';
+    const icon = r.status === 'ok' ? '✓' : r.status === 'risk' ? '⚠' : '✗';
+    const title = r.status === 'ok' ? `Реклама маркирована (${r.found} из ${r.total})` :
+                  r.status === 'risk' ? `Маркировка неполная (${r.found} из ${r.total})` :
+                  `Реклама без маркировки (${r.found} из ${r.total})`;
+    const items = r.items.map(item => {
+      const iconChar = item.present ? '✓' : '✗';
+      const iconCls = item.present ? 'ok' : 'miss';
+      return `<div class="sz-152-row">
+        <span class="sz-152-icon ${iconCls}">${iconChar}</span>
+        <span class="sz-152-label ${item.present ? '' : 'miss'}">${escapeHtml(item.label)}</span>
+      </div>`;
+    }).join('');
+    const missing = r.items.filter(i => !i.present);
+    const desc = missing.length > 0
+      ? `Отсутствует: ${escapeHtml(missing.map(i => i.label.toLowerCase()).join('; '))}. С 01.09.2022 интернет-реклама без токена ERID — штраф до 500 000 руб.`
+      : 'Рекламный контент маркирован корректно: токен ERID, метка «реклама», информация о рекламодателе на месте.';
+    return `<div class="sz-egrul-block ${cls}">
+      <div class="sz-egrul-title">${icon} ${title}</div>
+      <div class="sz-152-list">${items}</div>
+      <div class="sz-egrul-desc">${desc}</div>
+    </div>`;
+  }
+
+  function renderOfferBlock(r) {
+    // Не торговая площадка — оферта не обязательна
+    if (!r.isCommercial) {
+      return `<div class="sz-egrul-block good">
+        <div class="sz-egrul-title">✓ Информационный сайт</div>
+        <div class="sz-egrul-desc">Признаков торговой деятельности не обнаружено — публичная оферта и условия возврата не обязательны.</div>
+      </div>`;
+    }
+    const cls = r.status === 'ok' ? 'good' : r.status === 'risk' ? 'warn' : 'bad';
+    const icon = r.status === 'ok' ? '✓' : r.status === 'risk' ? '⚠' : '✗';
+    const title = r.status === 'ok' ? `Оферта на месте (${r.found} из ${r.total})` :
+                  r.status === 'risk' ? `Оферта неполная (${r.found} из ${r.total})` :
+                  `Критические пробелы (${r.found} из ${r.total})`;
+    const items = r.items.map(item => {
+      const iconChar = item.present ? '✓' : '✗';
+      const iconCls = item.present ? 'ok' : 'miss';
+      return `<div class="sz-152-row">
+        <span class="sz-152-icon ${iconCls}">${iconChar}</span>
+        <span class="sz-152-label ${item.present ? '' : 'miss'}">${escapeHtml(item.label)}</span>
+      </div>`;
+    }).join('');
+    const missing = r.items.filter(i => !i.present);
+    const desc = missing.length > 0
+      ? `Отсутствует: ${escapeHtml(missing.map(i => i.label.toLowerCase()).join('; '))}. По ЗоЗПП покупатель имеет право вернуть товар в течение 7 дней — это должно быть указано на сайте.`
+      : 'Все обязательные элементы публичной оферты на месте: договор, условия возврата, реквизиты продавца и контакты.';
     return `<div class="sz-egrul-block ${cls}">
       <div class="sz-egrul-title">${icon} ${title}</div>
       <div class="sz-152-list">${items}</div>
