@@ -7,6 +7,8 @@
 // @match        *://*/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_addStyle
+// @grant        GM_getValue
+// @grant        GM_setValue
 // @connect      api.groq.com
 // @connect      sleza.media
 // @connect      egrul.org
@@ -18,8 +20,20 @@
   'use strict';
 
   // ── API ключи ─────────────────────────────────
-  const GROQ_KEY  = 'YOUR_GROQ_API_KEY_HERE';
-  const SLEZA_KEY = 'YOUR_SLEZA_API_KEY_HERE';
+  // Хранятся в Tampermonkey storage (GM_setValue), а не в коде.
+  // Первый запуск — кнопка «СЛЕЗА // ПРОВЕРИТЬ» откроет форму ввода.
+  // В дальнейшем — кнопка «⚙ Ключи» в шапке модалки.
+  const _gmGet = (typeof GM_getValue === 'function') ? GM_getValue : ((_k, d) => d);
+  const _gmSet = (typeof GM_setValue === 'function') ? GM_setValue : (() => {});
+  let GROQ_KEY  = _gmGet('GROQ_KEY',  '');
+  let SLEZA_KEY = _gmGet('SLEZA_KEY', '');
+  function saveKeys(groq, sleza) {
+    GROQ_KEY  = (groq  || '').trim();
+    SLEZA_KEY = (sleza || '').trim();
+    try { _gmSet('GROQ_KEY',  GROQ_KEY);  } catch(_) {}
+    try { _gmSet('SLEZA_KEY', SLEZA_KEY); } catch(_) {}
+  }
+  function hasKeys() { return !!(GROQ_KEY && SLEZA_KEY); }
   // ──────────────────────────────────────────────
 
   // ── Поведение AI ──────────────────────────────
@@ -80,7 +94,10 @@
   function escapeRegex(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
 
   function parseSlezaItem(item) {
-    const match = item.match(/^(.+?)\s*\((.+)\)\s*💧?\s*$/);
+    // 💧 — surrogate pair; без non-capturing группы JS-regex без `u`-флага
+    // трактует `💧?` как `💧?` (требует high-surrogate), поэтому
+    // строки БЕЗ эмодзи перестали матчиться. `(?:💧)?` фиксит это.
+    const match = item.match(/^(.+?)\s*\((.+)\)\s*(?:💧)?\s*$/);
     if (!match) return { name: item.trim(), marking: '', category: 'other' };
     const name = match[1].trim();
     const marking = match[2].trim().replace(/💧$/, '').trim();
@@ -167,7 +184,7 @@
   function checkWithSleza(text) {
     return new Promise(resolve => {
       if (scanCancelled) return resolve({ found: 0, items: [], errors: 'cancelled' });
-      if (!SLEZA_KEY || SLEZA_KEY === 'YOUR_SLEZA_API_KEY_HERE') {
+      if (!SLEZA_KEY) {
         try { console.warn('[Слеза] SLEZA_KEY не заполнен — проверка иноагентов/экстремистов недоступна'); } catch(_) {}
         return resolve({ found: 0, items: [], errors: 'no_key' });
       }
@@ -201,13 +218,15 @@
   function extractIdentifiers(text) {
     const result = { inn: null, ogrn: null, type: null };
     // ОГРН (13) или ОГРНИП (15) — приоритет, потому что точнее
-    const ogrnMatch = text.match(/ОГРН(?:ИП)?[\s:№.]*([0-9]{13}|[0-9]{15})/i);
+    // ОГРН (13) или ОГРНИП (15). Порядок альтернатив важен: 15 должен идти первым,
+    // иначе на входе "320774600123456" движок жадно матчит первые 13 цифр и теряет ИП.
+    const ogrnMatch = text.match(/ОГРН(?:ИП)?[\s:№.]*([0-9]{15}|[0-9]{13})/i);
     if (ogrnMatch) {
       result.ogrn = ogrnMatch[1];
       result.type = ogrnMatch[1].length === 15 ? 'ip' : 'ul';
     }
-    // ИНН (10 для ЮЛ, 12 для ИП)
-    const innMatch = text.match(/ИНН[\s:№.]*([0-9]{10}|[0-9]{12})/i);
+    // ИНН (10 для ЮЛ, 12 для ИП). Та же причина — 12 должно идти первым.
+    const innMatch = text.match(/ИНН[\s:№.]*([0-9]{12}|[0-9]{10})/i);
     if (innMatch) {
       result.inn = innMatch[1];
       if (!result.type) result.type = innMatch[1].length === 12 ? 'ip' : 'ul';
@@ -1684,7 +1703,7 @@ U-47700;U-48800
       /\/contact/, /\/контакт/,
       /\/portfolio/, /\/портфолио/,
       /\/help/, /\/faq/, /\/помощ/,
-      /\/policy/, /\/политик/, /\/конфиденц/, /\/persondata/,
+      /\/policy/, /\/privacy/, /\/политик/, /\/конфиденц/, /\/persondata/,
       /\/offer/, /\/оферт/, /\/agreement/, /\/договор/, /\/правила/
     ];
     if (MED.some(p => p.test(full))) return 5;
@@ -2058,6 +2077,7 @@ U-47700;U-48800
             <div class="sz-brand">СЛЕЗА // COMPLIANCE SCANNER<span class="sz-vbadge">v7.0 FULL SITE</span></div>
             <div class="sz-hsub">ВЫБЕРИТЕ РЕЖИМ ПРОВЕРКИ</div>
           </div>
+          <button class="sz-close" id="sz-settings" title="Изменить API-ключи">⚙ Ключи</button>
           <button class="sz-close" id="sz-x">✕ закрыть</button>
         </div>
         <div class="sz-body" id="sz-bd"></div>
@@ -2066,8 +2086,45 @@ U-47700;U-48800
 
     document.body.appendChild(ov);
     document.getElementById('sz-x').onclick = closeModal;
+    document.getElementById('sz-settings').onclick = () => showSettings(false);
     document.getElementById('sz-restore').onclick = () => setModalDimmed(false);
-    showModeChooser();
+    if (!hasKeys()) showSettings(true);
+    else showModeChooser();
+  }
+
+  function showSettings(firstRun) {
+    const bd = document.getElementById('sz-bd');
+    bd.innerHTML = `
+      <div style="padding:8px 0 4px;text-align:center;color:#94a3b8;font-size:13px;line-height:1.6">
+        <div style="font-family:'Courier New',monospace;font-size:10px;color:#3b82f6;letter-spacing:.1em;text-transform:uppercase;margin-bottom:6px">API-ключи</div>
+        <div>${firstRun ? 'Введите ключи для запуска сканера. Они хранятся локально в Tampermonkey, не в коде.' : 'Изменение ключей. Сохраняется локально в Tampermonkey.'}</div>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:10px;padding:14px 4px 6px;max-width:560px;margin:0 auto">
+        <label style="display:flex;flex-direction:column;gap:4px;font-family:'Courier New',monospace;font-size:11px;color:#94a3b8">
+          <span>GROQ_KEY <span style="color:#64748b">— api.groq.com</span></span>
+          <input id="sz-key-groq" type="password" value="${escapeHtml(GROQ_KEY)}" placeholder="gsk_..."
+            style="background:#0f172a;border:1px solid #334155;border-radius:6px;color:#e2e8f0;padding:8px 10px;font-family:'Courier New',monospace;font-size:12px;outline:none">
+        </label>
+        <label style="display:flex;flex-direction:column;gap:4px;font-family:'Courier New',monospace;font-size:11px;color:#94a3b8">
+          <span>SLEZA_KEY <span style="color:#64748b">— sleza.media/api</span></span>
+          <input id="sz-key-sleza" type="password" value="${escapeHtml(SLEZA_KEY)}" placeholder="..."
+            style="background:#0f172a;border:1px solid #334155;border-radius:6px;color:#e2e8f0;padding:8px 10px;font-family:'Courier New',monospace;font-size:12px;outline:none">
+        </label>
+        <div style="display:flex;gap:8px;margin-top:6px">
+          <button id="sz-key-save" style="flex:1;background:#3b82f6;border:none;border-radius:6px;color:#fff;padding:10px 14px;font-family:'Courier New',monospace;font-size:11px;letter-spacing:.05em;text-transform:uppercase;cursor:pointer">Сохранить</button>
+          ${firstRun ? '' : '<button id="sz-key-cancel" style="background:#1e293b;border:1px solid #334155;border-radius:6px;color:#94a3b8;padding:10px 14px;font-family:\'Courier New\',monospace;font-size:11px;letter-spacing:.05em;text-transform:uppercase;cursor:pointer">Отмена</button>'}
+        </div>
+        <div style="color:#64748b;font-size:10px;text-align:center;padding-top:4px">
+          Ключи сохраняются через GM_setValue. Никуда не отправляются, кроме соответствующих API.
+        </div>
+      </div>`;
+    document.getElementById('sz-key-save').onclick = () => {
+      const g = document.getElementById('sz-key-groq').value;
+      const s = document.getElementById('sz-key-sleza').value;
+      saveKeys(g, s);
+      showModeChooser();
+    };
+    if (!firstRun) document.getElementById('sz-key-cancel').onclick = showModeChooser;
   }
 
   function closeModal() {
@@ -2539,7 +2596,7 @@ U-47700;U-48800
     // AI-арбитр: если локально найдено 1-5 из 7 — спрашиваем модель по каждому пропущенному пункту.
     // Никогда не понижает статус, только дополняет. При ошибке/таймауте — возвращает локальный результат.
     // Пропускается если USE_AI=false или нет ключа.
-    const groqForArbiter = USE_AI && GROQ_KEY && GROQ_KEY !== 'YOUR_GROQ_API_KEY_HERE';
+    const groqForArbiter = USE_AI && !!GROQ_KEY;
     if (groqForArbiter && result152.status !== 'no_policy' && result152.found >= 1 && result152.found < 6) {
       result152 = await verify152FZWithAI(policyText, result152);
     }
@@ -2630,9 +2687,9 @@ U-47700;U-48800
     msg += `═══════════════════════════════════════════\n`;
 
     // ── Если AI отключён или нет ключа — собираем отчёт только из локальных чек-листов ──
-    const groqAvailable = USE_AI && GROQ_KEY && GROQ_KEY !== 'YOUR_GROQ_API_KEY_HERE';
+    const groqAvailable = USE_AI && !!GROQ_KEY;
     if (!groqAvailable) {
-      try { console.log('[Слеза] Groq пропущен (USE_AI=' + USE_AI + ', key=' + (GROQ_KEY === 'YOUR_GROQ_API_KEY_HERE' ? 'нет' : 'есть') + '). Используем локальные чек-листы.'); } catch(_) {}
+      try { console.log('[Слеза] Groq пропущен (USE_AI=' + USE_AI + ', key=' + (GROQ_KEY ? 'есть' : 'нет') + '). Используем локальные чек-листы.'); } catch(_) {}
       return {
         site_name: c.title || c.url,
         site_type: '',
@@ -2917,8 +2974,8 @@ U-47700;U-48800
       ${slezaError ? `<div style="background:rgba(239,68,68,.08);border:1px solid rgba(239,68,68,.3);border-radius:8px;padding:10px 14px;margin-bottom:10px;font-family:'Courier New',monospace;font-size:11px;color:#f87171;line-height:1.6">
         ⚠ API Слезы недоступен (${escapeHtml(String(slezaError))})<br>
         <span style="color:#94a3b8">${
-          slezaError === 'no_key' ? 'SLEZA_KEY не заполнен — откройте скрипт в Tampermonkey и впишите ключ в строке 22.' :
-          /^http_(401|403)/.test(slezaError) ? 'Неверный SLEZA_KEY — проверьте API-ключ в настройках скрипта (строка ~22).' :
+          slezaError === 'no_key' ? 'SLEZA_KEY не заполнен — нажмите «⚙ Ключи» в шапке модалки и введите его.' :
+          /^http_(401|403)/.test(slezaError) ? 'Неверный SLEZA_KEY — нажмите «⚙ Ключи» в шапке и обновите его.' :
           /^http_422/.test(slezaError) ? 'Подписка на sleza.media неактивна — войдите в аккаунт и активируйте подписку.' :
           /^http_/.test(slezaError) ? 'API вернул ошибку. Проверьте статус sleza.media.' :
           slezaError === 'timeout' ? 'API не ответил за 10 сек. Возможно перегрузка — попробуйте позже.' :
@@ -3374,5 +3431,21 @@ U-47700;U-48800
       <div class="sz-egrul-row"><span>Статус:</span> <strong class="${p.isActive ? 'ok' : 'bad'}">${p.isActive ? 'ДЕЙСТВУЮЩАЯ' : 'ПРЕКРАЩЕНА'}</strong></div>
       ${!p.isActive && p.reason ? `<div class="sz-egrul-desc">${escapeHtml(p.reason)} — критическое нарушение, сайт нельзя использовать для коммерческой деятельности.</div>` : ''}
     </div>`;
+  }
+
+  // ── Экспорт чистых функций для тестов (Node/vitest) ─────────────
+  // В Tampermonkey `module` undefined и блок игнорируется.
+  if (typeof module !== 'undefined' && module.exports) {
+    module.exports = {
+      escapeHtml, escapeRegex,
+      parseSlezaItem, checkMarkingNearby, checkWithSleza,
+      extractIdentifiers, checkEgrul, parseEgrulData,
+      hasNameLikePatterns,
+      check152FZ, check149FZ, checkERIR, checkCookieCompliance,
+      checkOffer, getDrugRegex, checkDrugs,
+      scoreUrl, isHtmlUrl, extractYearFromUrl,
+      runAIAnalysis, verify152FZWithAI,
+      buildLocalChecks,
+    };
   }
 })();
