@@ -23,8 +23,11 @@
   // Хранятся в Tampermonkey storage (GM_setValue), а не в коде.
   // Первый запуск — кнопка «СЛЕЗА // ПРОВЕРИТЬ» откроет форму ввода.
   // В дальнейшем — кнопка «⚙ Ключи» в шапке модалки.
-  const _gmGet = (typeof GM_getValue === 'function') ? GM_getValue : ((_k, d) => d);
-  const _gmSet = (typeof GM_setValue === 'function') ? GM_setValue : (() => {});
+  // Key storage: GM_getValue/GM_setValue in Tampermonkey; replaceable via setKeyStore() for web.
+  let _gmGet = (typeof GM_getValue === 'function') ? GM_getValue : ((_k, d) => d);
+  let _gmSet = (typeof GM_setValue === 'function') ? GM_setValue : (() => {});
+  function setKeyStore({ get, set }) { _gmGet = get; _gmSet = set; }
+
   let GROQ_KEY  = _gmGet('GROQ_KEY',  '');
   let SLEZA_KEY = _gmGet('SLEZA_KEY', '');
   function saveKeys(groq, sleza) {
@@ -33,6 +36,10 @@
     try { _gmSet('GROQ_KEY',  GROQ_KEY);  } catch(_) {}
     try { _gmSet('SLEZA_KEY', SLEZA_KEY); } catch(_) {}
   }
+
+  // HTTP transport: GM_xmlhttpRequest in Tampermonkey; replaceable via setHttpTransport() for web.
+  let _httpRequest = (typeof GM_xmlhttpRequest === 'function') ? GM_xmlhttpRequest : null;
+  function setHttpTransport(fn) { _httpRequest = fn; }
   function hasKeys() { return !!(GROQ_KEY && SLEZA_KEY); }
   // ──────────────────────────────────────────────
 
@@ -188,7 +195,7 @@
         try { console.warn('[Слеза] SLEZA_KEY не заполнен — проверка иноагентов/экстремистов недоступна'); } catch(_) {}
         return resolve({ found: 0, items: [], errors: 'no_key' });
       }
-      GM_xmlhttpRequest({
+      _httpRequest({
         method: 'POST',
         url: 'https://sleza.media/api/parse',
         timeout: 10000,
@@ -238,7 +245,7 @@
   function checkEgrul(identifier) {
     return new Promise(resolve => {
       if (!identifier || scanCancelled) return resolve(null);
-      GM_xmlhttpRequest({
+      _httpRequest({
         method: 'GET',
         url: `https://egrul.org/${identifier}.json`,
         timeout: 8000,
@@ -1470,7 +1477,7 @@ U-47700;U-48800
   function fetchUrl(url) {
     return new Promise(resolve => {
       if (scanCancelled) return resolve({ url, ok: false, html: '', text: '' });
-      GM_xmlhttpRequest({
+      _httpRequest({
         method: 'GET', url, timeout: FETCH_TIMEOUT,
         onload(r) {
           try {
@@ -2146,7 +2153,7 @@ U-47700;U-48800
     bd.innerHTML = `
       <div style="padding:8px 0 4px;text-align:center;color:#94a3b8;font-size:13px;line-height:1.6">
         <div style="font-family:'Courier New',monospace;font-size:10px;color:#3b82f6;letter-spacing:.1em;text-transform:uppercase;margin-bottom:6px">Что проверяем</div>
-        <div>${location.hostname}</div>
+        <div>${escapeHtml(location.hostname)}</div>
       </div>
       <div class="sz-mode">
         <div class="sz-mode-btn" id="mode-current">
@@ -2179,7 +2186,7 @@ U-47700;U-48800
       <div class="sz-progress">
         <div class="sz-spinner"></div>
         <div class="sz-prog-title">${phaseText}</div>
-        <div class="sz-prog-stage">${url ? '→ ' + url.slice(0, 80) : ''}</div>
+        <div class="sz-prog-stage">${url ? '→ ' + escapeHtml(url.slice(0, 80)) : ''}</div>
         ${total > 0 ? `<div class="sz-prog-bar"><div class="sz-prog-fill" style="width:${pct}%"></div></div>` : ''}
         <div class="sz-prog-stats">
           ${total > 0 ? `<span>${current}</span> из <span>${total}</span> страниц` : ''}
@@ -2198,6 +2205,7 @@ U-47700;U-48800
 
   // ── Сценарий: одна страница ───────────────────
   async function runSinglePageScan() {
+    SKIP_REASONS.clear();
     showProgress({ phase: 'sleza', current: 0, total: 1, url: location.href });
     const c = getCurrentPageContent();
     const fullText = `${c.title}\n${c.header}\n${c.bodyText}\n${c.footer}`;
@@ -2480,7 +2488,7 @@ U-47700;U-48800
     const user = `ПУНКТЫ ДЛЯ ПРОВЕРКИ:\n${missing.map(m => `- ${m.id}: ${m.label}`).join('\n')}\n\nТЕКСТ ПОЛИТИКИ:\n${policySnippet}`;
 
     return new Promise(resolve => {
-      GM_xmlhttpRequest({
+      _httpRequest({
         method: 'POST',
         url: 'https://api.groq.com/openai/v1/chat/completions',
         timeout: 15000,
@@ -2705,7 +2713,7 @@ U-47700;U-48800
     }
 
     return new Promise(resolve => {
-      GM_xmlhttpRequest({
+      _httpRequest({
         method: 'POST',
         url: 'https://api.groq.com/openai/v1/chat/completions',
         headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + GROQ_KEY },
@@ -3448,9 +3456,11 @@ U-47700;U-48800
       hasNameLikePatterns,
       check152FZ, check149FZ, checkERIR, checkCookieCompliance,
       checkOffer, getDrugRegex, checkDrugs,
-      scoreUrl, isHtmlUrl, extractYearFromUrl,
+      scoreUrl, isHtmlUrl, extractYearFromUrl, strideSample, sampleByYear,
+      fetchUrl, trySitemap, crawlSite, discoverPolicyByCommonPaths,
       runAIAnalysis, verify152FZWithAI,
-      buildLocalChecks,
+      buildLocalChecks, plural,
+      setHttpTransport, setKeyStore, saveKeys,
     };
   }
 })();
