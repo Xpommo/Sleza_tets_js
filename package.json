@@ -1,0 +1,20 @@
+{
+  "name": "sleza-tets-js",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Tampermonkey compliance scanner — test suite",
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:ci": "vitest run --reporter=default --reporter=junit --outputFile=test-results.xml",
+    "test:html": "vitest run --reporter=html",
+    "test:coverage": "vitest run --coverage",
+    "calibrate": "node tests/calibrate.js",
+    "postinstall": "node -e \"console.log('\\n— Для калибровки запусти один раз: npx playwright install chromium')\""
+  },
+  "devDependencies": {
+    "@vitest/coverage-v8": "^2.1.9",
+    "playwright": "^1.60.0",
+    "vitest": "^2.1.9"
+  }
+}

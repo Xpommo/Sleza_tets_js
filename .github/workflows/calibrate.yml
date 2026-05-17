@@ -1,0 +1,36 @@
+name: calibrate
+
+# Запускается вручную из вкладки Actions в GitHub (включая мобильную версию).
+# Принимает список URL через запятую — пропускает их через все локальные чек-листы
+# и выводит результат в лог. Без AI, без Sleza, без ЕГРЮЛ.
+on:
+  workflow_dispatch:
+    inputs:
+      urls:
+        description: 'URLs через пробел или запятую. Пусто = дефолт (snob/vc/rbc).'
+        required: false
+        default: ''
+
+jobs:
+  calibrate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+      - run: npm ci
+      - name: Run calibration
+        run: |
+          urls="${{ github.event.inputs.urls }}"
+          # Заменяем запятые на пробелы, чтобы можно было перечислять и так и так
+          urls="${urls//,/ }"
+          echo "::group::Calibration output"
+          if [ -z "$urls" ]; then
+            node tests/calibrate.js
+          else
+            # shellcheck disable=SC2086
+            node tests/calibrate.js $urls
+          fi
+          echo "::endgroup::"
