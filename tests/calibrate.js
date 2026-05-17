@@ -20,10 +20,15 @@ try {
 }
 
 const DEFAULT_TARGETS = [
-  { url: 'https://snob.ru/',                        kind: 'home',   site: 'snob.ru' },
+  // 152-ФЗ: эталонная политика
   { url: 'https://snob.ru/static-pages/privacy/',   kind: 'policy', site: 'snob.ru' },
+  // 149-ФЗ: страницы где должны быть реквизиты владельца сайта
+  { url: 'https://snob.ru/static-pages/about/',     kind: 'home',   site: 'snob.ru/about' },
+  { url: 'https://snob.ru/',                        kind: 'home',   site: 'snob.ru' },
+  // vc.ru — проверяем false positive на оферту (ecommerce vs media)
   { url: 'https://vc.ru/',                          kind: 'home',   site: 'vc.ru' },
-  { url: 'https://www.rbc.ru/',                     kind: 'home',   site: 'rbc.ru' },
+  // Сайт с гарантированно полным footer (yandex.ru/legal — статический HTML)
+  { url: 'https://yandex.ru/legal/confidential/',   kind: 'policy', site: 'yandex.ru' },
 ];
 
 const argv = process.argv.slice(2);
@@ -85,7 +90,26 @@ async function renderPage(browser, url) {
 
     const html = await page.content();
     const text = await page.evaluate(() => document.body?.innerText || '');
-    return { ok: true, status: resp?.status() ?? 0, html, text };
+    // Скрипт в TM пулит <footer> отдельно — делаем то же, чтобы реквизиты из подвала
+    // не терялись если innerText body почему-то их обрезает.
+    const footerText = await page.evaluate(() => {
+      const f = document.querySelector('footer,#footer,.footer,[class*="footer"]');
+      return f ? (f.innerText || f.textContent || '').slice(0, 5000) : '';
+    });
+    // Полный текст из HTML по тому же алгоритму что fetchUrl в скрипте —
+    // включает hidden/below-the-fold элементы, которые innerText пропускает.
+    const stripped = html
+      .replace(/<script[\s\S]*?<\/script>/gi, '')
+      .replace(/<style[\s\S]*?<\/style>/gi, '')
+      .replace(/<noscript[\s\S]*?<\/noscript>/gi, '')
+      .replace(/<[^>]+>/g, ' ')
+      .replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&')
+      .replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+      .replace(/&quot;/g, '"').replace(/&#39;/g, "'")
+      .replace(/\s+/g, ' ').trim();
+    // Берём максимум — то что больше: визуальный innerText + footer, или полный stripped.
+    const combined = [text, footerText, stripped].sort((a, b) => b.length - a.length)[0];
+    return { ok: true, status: resp?.status() ?? 0, html, text: combined, innerText: text, footerText, stripped };
   } catch (e) {
     return { ok: false, error: String(e.message || e).slice(0, 200) };
   } finally {
@@ -109,7 +133,7 @@ try {
       console.log(`  ${fmt.miss} render failed: ${r.error}\n`);
       continue;
     }
-    console.log(`  ${dim(`HTTP ${r.status}, rendered ${r.text.length.toLocaleString()} chars`)}`);
+    console.log(`  ${dim(`HTTP ${r.status}, innerText=${r.innerText.length}, footer=${r.footerText.length}, stripped=${r.stripped.length} → using ${r.text.length} chars`)}`);
 
     if (t.kind === 'policy') {
       const r152 = api.check152FZ(r.text);
@@ -140,6 +164,21 @@ try {
       }
       console.log(`  ЕРИР    ${status(erir.status)}  ${dim(`hasAdContent=${erir.hasAdContent}, found ${erir.found}/${erir.total}`)}`);
       console.log(`  Оферта  ${status(offer.status)}  ${dim(`isCommercial=${offer.isCommercial}${offer.kind ? `, kind=${offer.kind}` : ''}, ${offer.found}/${offer.total}`)}`);
+      // Если коммерческий определён — покажем какие фразы это спровоцировали (для отладки false positive).
+      if (offer.isCommercial) {
+        const sample = r.text.toLowerCase();
+        const probes = {
+          'купить':           /(?:^|[^а-яёa-z0-9_])купить(?=[^а-яёa-z0-9_]|$)/i,
+          'корзина':          /(?:^|[^а-яёa-z0-9_])корзин[аеуыой](?=[^а-яёa-z0-9_]|$)/i,
+          'цена/руб/₽':       /(\d+[\s\-]*₽|\d+[\s\-]*руб)/i,
+          'доставка':         /(?:^|[^а-яёa-z0-9_])(доставка|курьер|самовывоз)(?=[^а-яёa-z0-9_]|$)/i,
+          'интернет-магазин': /интернет[\-\s]?магазин/i,
+          'тариф/подписка':   /(?:^|[^а-яёa-z0-9_])(тариф|подписка|абонемент)[а-яё]*(?=[^а-яёa-z0-9_]|$)/i,
+          'исполнитель':      /(?:^|[^а-яёa-z0-9_])исполнител[ьяюуео]+(?=[^а-яёa-z0-9_]|$)/i,
+        };
+        const hits = Object.entries(probes).filter(([_, re]) => re.test(sample)).map(([k]) => k);
+        if (hits.length) console.log(`    ${dim(`триггеры: ${hits.join(', ')}`)}`);
+      }
       console.log(`  Cookie  ${status(cookie.status)}  ${dim(cookie.title)}`);
       console.log(`  Drugs   ${status(drugs.status)}  ${dim(drugs.hasMentions ? `${drugs.totalMentions} упоминаний, ${drugs.withoutContext} без контекста` : 'нет упоминаний')}`);
     }
