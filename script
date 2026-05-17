@@ -187,6 +187,7 @@
 
   // ── Запросы ───────────────────────────────────
   let scanCancelled = false;
+  function setScanCancelled(v) { scanCancelled = !!v; }
 
   function checkWithSleza(text) {
     return new Promise(resolve => {
@@ -3470,7 +3471,7 @@ U-47700;U-48800
       fetchUrl, trySitemap, crawlSite, discoverPolicyByCommonPaths, extractLocs,
       runAIAnalysis, verify152FZWithAI,
       buildLocalChecks, plural,
-      setHttpTransport, setKeyStore, saveKeys,
+      setHttpTransport, setKeyStore, saveKeys, setScanCancelled,
     };
   }
 })();

@@ -90,3 +90,64 @@ describe('buildLocalChecks', () => {
     expect(result.find(c => c.id === 'drugs').status).toBe('ok');
   });
 });
+
+describe('buildLocalChecks — 149-ФЗ', () => {
+  it('149 ok status passes through', () => {
+    const result149 = { status: 'ok', found: 5, total: 5, items: [] };
+    const result = buildLocalChecks({ result149 });
+    expect(result.find(c => c.id === 'law149').status).toBe('ok');
+  });
+
+  it('149 violation passes through', () => {
+    const result149 = { status: 'violation', found: 1, total: 5, items: [{ id: 'inn_ogrn', label: 'ИНН/ОГРН', present: false }] };
+    const result = buildLocalChecks({ result149 });
+    expect(result.find(c => c.id === 'law149').status).toBe('violation');
+  });
+
+  it('inactive EGRUL overrides 149 status → violation', () => {
+    const result149 = { status: 'ok', found: 5, total: 5, items: [] };
+    const egrul = { result: { parsed: { isActive: false, reason: 'Ликвидация' }, found: true } };
+    const result = buildLocalChecks({ result149, egrul });
+    expect(result.find(c => c.id === 'law149').status).toBe('violation');
+  });
+});
+
+describe('buildLocalChecks — ЕРИР', () => {
+  it('no ad content → status ok with no-ads message', () => {
+    const resultERIR = { status: 'ok', hasAdContent: false, items: [] };
+    const result = buildLocalChecks({ resultERIR });
+    expect(result.find(c => c.id === 'erir').status).toBe('ok');
+  });
+
+  it('ad content violation passes through', () => {
+    const resultERIR = {
+      status: 'violation',
+      hasAdContent: true,
+      items: [
+        { id: 'erid', label: 'ERID-токен', present: false },
+        { id: 'label', label: 'Метка «реклама»', present: false },
+      ],
+    };
+    const result = buildLocalChecks({ resultERIR });
+    expect(result.find(c => c.id === 'erir').status).toBe('violation');
+  });
+});
+
+describe('buildLocalChecks — оферта', () => {
+  it('non-commercial site → offer ok', () => {
+    const resultOffer = { status: 'ok', isCommercial: false, kind: null, items: [] };
+    const result = buildLocalChecks({ resultOffer });
+    expect(result.find(c => c.id === 'offer').status).toBe('ok');
+  });
+
+  it('commercial violation passes through', () => {
+    const resultOffer = {
+      status: 'violation',
+      isCommercial: true,
+      kind: 'ecommerce',
+      items: [{ id: 'offer_exists', label: 'Оферта', present: false }],
+    };
+    const result = buildLocalChecks({ resultOffer });
+    expect(result.find(c => c.id === 'offer').status).toBe('violation');
+  });
+});
