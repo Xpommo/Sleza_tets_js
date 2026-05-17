@@ -5,7 +5,6 @@
  * Запуск: node tests/calibrate.js [url1 url2 ...]
  */
 import { loadScript } from './loadScript.js';
-import { execSync } from 'node:child_process';
 
 const DEFAULT_TARGETS = [
   // snob.ru: эталон, политика 7/7, в подвале реквизиты
@@ -24,12 +23,19 @@ const targets = argv.length
   ? argv.map(u => ({ url: u, kind: u.match(/privac|policy|конфиденц|persondata/i) ? 'policy' : 'home', site: new URL(u).hostname }))
   : DEFAULT_TARGETS;
 
-function fetchText(url) {
+async function fetchText(url) {
   try {
-    const html = execSync(
-      `curl -sL --max-time 15 -A 'Mozilla/5.0 (X11; Linux x86_64) Slezа-Calibrator' '${url}'`,
-      { maxBuffer: 50 * 1024 * 1024, encoding: 'utf8' }
-    );
+    const res = await fetch(url, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (compatible; Sleza-Calibrator/1.0)',
+        'Accept': 'text/html,application/xhtml+xml,*/*',
+        'Accept-Language': 'ru,en;q=0.8',
+      },
+      redirect: 'follow',
+      signal: AbortSignal.timeout(20000),
+    });
+    if (!res.ok) return { ok: false, error: `HTTP ${res.status}` };
+    const html = await res.text();
     // Воспроизводим логику fetchUrl из script: вырезаем script/style/noscript, HTML-теги, нормализуем пробелы.
     const text = html
       .replace(/<script[\s\S]*?<\/script>/gi, '')
@@ -40,7 +46,7 @@ function fetchText(url) {
       .replace(/&lt;/g, '<').replace(/&gt;/g, '>')
       .replace(/&quot;/g, '"').replace(/&#39;/g, "'")
       .replace(/\s+/g, ' ').trim();
-    return { ok: true, text, html, status: 200 };
+    return { ok: true, text, html, status: res.status };
   } catch (e) {
     return { ok: false, error: String(e.message || e).slice(0, 200) };
   }
@@ -62,7 +68,7 @@ console.log('\n══════════════ КАЛИБРОВКА �
 
 for (const t of targets) {
   console.log(`▶ ${t.site.padEnd(12)} ${dim(t.url)}`);
-  const r = fetchText(t.url);
+  const r = await fetchText(t.url);
   if (!r.ok) {
     console.log(`  ${fmt.miss} fetch failed: ${r.error}\n`);
     continue;
