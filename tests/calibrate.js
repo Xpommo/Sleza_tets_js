@@ -107,8 +107,10 @@ async function renderPage(browser, url) {
       .replace(/&lt;/g, '<').replace(/&gt;/g, '>')
       .replace(/&quot;/g, '"').replace(/&#39;/g, "'")
       .replace(/\s+/g, ' ').trim();
-    // Берём максимум — то что больше: визуальный innerText + footer, или полный stripped.
-    const combined = [text, footerText, stripped].sort((a, b) => b.length - a.length)[0];
+    // Склеиваем все три источника (как делает скрипт: header + body + footer).
+    // Дубли не мешают — regex одинаково матчатся, а footer-текст из отдельного DOM-узла
+    // часто не попадает в innerText (display:none или sticky positioning).
+    const combined = [text, footerText, stripped].filter(Boolean).join('\n\n');
     return { ok: true, status: resp?.status() ?? 0, html, text: combined, innerText: text, footerText, stripped };
   } catch (e) {
     return { ok: false, error: String(e.message || e).slice(0, 200) };
@@ -140,6 +142,35 @@ try {
       console.log(`  152-ФЗ ${status(r152.status)} ${r152.found}/${r152.total}`);
       for (const i of r152.items) {
         console.log(`    ${i.present ? fmt.ok : fmt.miss} ${i.label}`);
+      }
+      // Для пропущенных пунктов ищем релевантные ключевики в тексте и печатаем
+      // окно ±120 симв. — видно ЧТО именно сайт пишет про этот аспект и почему
+      // наш regex это пропустил.
+      const probes = {
+        categories:     /категори[яийюях]+/i,
+        purposes:       /цел[ьейяиюях]+/i,
+        legal_basis:    /основан/i,
+        storage_term:   /(срок|хран|удал|уничтож|период)/i,
+        subject_rights: /(прав[аоеыхими]+\s+субъект|отзыв|вправе|потребова|удалит|изменит)/i,
+        contact:        /(контакт|связ[аь]|оператор|ответствен|email|e-?mail|почт)/i,
+        third_parties:  /(треть|сторон|партн|передач)/i,
+      };
+      const missing = r152.items.filter(i => !i.present);
+      for (const m of missing) {
+        const re = probes[m.id];
+        if (!re) continue;
+        const matches = [...r.text.matchAll(new RegExp(re.source, 'gi'))].slice(0, 3);
+        if (matches.length === 0) {
+          console.log(`    ${dim(`└ ${m.id}: ключевиков не нашлось вовсе → раздел реально отсутствует`)}`);
+          continue;
+        }
+        console.log(`    ${dim(`└ ${m.id}: что говорит сайт (${matches.length} места):`)}`);
+        for (const mm of matches) {
+          const start = Math.max(0, mm.index - 80);
+          const end = Math.min(r.text.length, mm.index + 200);
+          const snippet = r.text.slice(start, end).replace(/\s+/g, ' ').trim();
+          console.log(`      ${dim('…' + snippet + '…')}`);
+        }
       }
     } else {
       const r149  = api.check149FZ(r.text);
