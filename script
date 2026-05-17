@@ -38,7 +38,9 @@
   }
 
   // HTTP transport: GM_xmlhttpRequest in Tampermonkey; replaceable via setHttpTransport() for web.
-  let _httpRequest = (typeof GM_xmlhttpRequest === 'function') ? GM_xmlhttpRequest : null;
+  let _httpRequest = (typeof GM_xmlhttpRequest === 'function')
+    ? GM_xmlhttpRequest
+    : () => { throw new Error('[Слеза] setHttpTransport() не вызван — нет HTTP-транспорта'); };
   function setHttpTransport(fn) { _httpRequest = fn; }
   function hasKeys() { return !!(GROQ_KEY && SLEZA_KEY); }
   // ──────────────────────────────────────────────
