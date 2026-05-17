@@ -138,4 +138,10 @@ describe('check152FZ — individual points', () => {
     const r = check152FZ(base + 'Данные хранятся в течение 3 лет.');
     expect(r.items.find(i => i.id === 'storage_term').present).toBe(true);
   });
+
+  it('detects storage_term via casual "как долго мы храним"', () => {
+    // Реальная формулировка из политики Яндекса (раздел 8). Раньше пропускалась.
+    const r = check152FZ(base + '8. Как долго мы храним Вашу персональную информацию');
+    expect(r.items.find(i => i.id === 'storage_term').present).toBe(true);
+  });
 });
