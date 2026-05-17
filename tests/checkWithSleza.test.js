@@ -53,4 +53,36 @@ describe('checkWithSleza — under mocked GM_xmlhttpRequest', () => {
     const r = await checkWithSleza('text');
     expect(String(r.errors)).toMatch(/^parse_http_/);
   });
+
+  it('returns errors:http_<status> for 4xx with valid JSON body', async () => {
+    // e.g. 403 Forbidden or 429 rate-limit — API returns JSON but status != 200
+    const { exports: { checkWithSleza } } = loadScript({
+      gmValues: { SLEZA_KEY: 'k' },
+      gmRoutes: [{
+        match: () => true,
+        response: { status: 403, responseText: JSON.stringify({ error: 'forbidden' }) },
+      }],
+    });
+    const r = await checkWithSleza('text');
+    expect(r.errors).toBe('http_403');
+    expect(r.raw).toEqual({ error: 'forbidden' });
+  });
+
+  it('returns valid result with items on successful 200', async () => {
+    const payload = {
+      found: 2,
+      items: [
+        { name: 'Иван Иванов', category: 'foreign_agent', marking: 'иностранный агент' },
+        { name: 'ООО Пример', category: 'undesirable', marking: '' },
+      ],
+    };
+    const { exports: { checkWithSleza } } = loadScript({
+      gmValues: { SLEZA_KEY: 'test-key' },
+      gmRoutes: [{ match: () => true, response: { status: 200, responseText: JSON.stringify(payload) } }],
+    });
+    const r = await checkWithSleza('Иван Иванов упомянул ООО Пример');
+    expect(r.errors).toBeUndefined();
+    expect(r.found).toBe(2);
+    expect(r.items).toHaveLength(2);
+  });
 });

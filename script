@@ -1734,6 +1734,7 @@ U-47700;U-48800
   async function crawlSite(startUrl, maxPages, maxDepth, onProgress) {
     const origin = new URL(startUrl).origin;
     const visited = new Set();
+    const queued = new Set([startUrl]); // O(1) duplicate check for the queue
     const queue = [{ url: startUrl, depth: 0 }];
     const results = [];
 
@@ -1758,7 +1759,8 @@ U-47700;U-48800
 
         const unique = [...new Set(links)];
         unique.slice(0, 20).forEach(u => {
-          if (!visited.has(u) && !queue.find(q => q.url === u)) {
+          if (!visited.has(u) && !queued.has(u)) {
+            queued.add(u);
             queue.push({ url: u, depth: depth + 1 });
           }
         });
