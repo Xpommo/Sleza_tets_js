@@ -51,15 +51,38 @@ async function renderPage(browser, url) {
     userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
                '(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
     locale: 'ru-RU',
-    viewport: { width: 1280, height: 800 },
+    viewport: { width: 1280, height: 900 },
+    extraHTTPHeaders: {
+      'Accept-Language': 'ru-RU,ru;q=0.9,en;q=0.5',
+      'Sec-Ch-Ua': '"Chromium";v="131", "Not_A Brand";v="24"',
+      'Sec-Ch-Ua-Mobile': '?0',
+      'Sec-Ch-Ua-Platform': '"Windows"',
+    },
+  });
+  // Маскируем webdriver-флаг, который Cloudflare/Akamai используют для блокировки headless.
+  await ctx.addInitScript(() => {
+    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
   });
   const page = await ctx.newPage();
   try {
-    const resp = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 25000 });
-    // Дожидаемся, чтобы SPA успела отрендериться. networkidle бывает несбыточен на
-    // сайтах с длинными WebSocket-соединениями, поэтому ставим короткий timeout
-    // и проглатываем неудачу — основной DOM уже есть.
+    const resp = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
     try { await page.waitForLoadState('networkidle', { timeout: 6000 }); } catch (_) {}
+
+    // Скроллим до конца страницы порциями — на SPA footer рендерится lazy, в Tampermonkey
+    // пользователь обычно уже долистал. Без этого подвал с ИНН/ОГРН в HTML не попадает.
+    await page.evaluate(async () => {
+      const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+      let prev = 0;
+      for (let i = 0; i < 20; i++) {
+        window.scrollTo(0, document.body.scrollHeight);
+        await sleep(250);
+        if (document.body.scrollHeight === prev) break;
+        prev = document.body.scrollHeight;
+      }
+      window.scrollTo(0, 0);
+      await sleep(200);
+    });
+
     const html = await page.content();
     const text = await page.evaluate(() => document.body?.innerText || '');
     return { ok: true, status: resp?.status() ?? 0, html, text };
