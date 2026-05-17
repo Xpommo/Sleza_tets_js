@@ -98,4 +98,15 @@ describe('trySitemap', () => {
     expect(r).not.toBeNull();
     expect(r.urls).toContain(`${ORIGIN}/article/1`);
   });
+
+  it('handles CDATA-wrapped <loc> elements', async () => {
+    const xml = `<?xml version="1.0"?><urlset>
+      <url><loc><![CDATA[${ORIGIN}/cdata-page]]></loc></url>
+      <url><loc>${ORIGIN}/normal-page</loc></url>
+    </urlset>`;
+    const { exports: { trySitemap } } = loadScript({ gmRoutes: [route('/sitemap.xml', xml), ERR] });
+    const r = await trySitemap(ORIGIN);
+    expect(r.urls).toContain(`${ORIGIN}/cdata-page`);
+    expect(r.urls).toContain(`${ORIGIN}/normal-page`);
+  });
 });

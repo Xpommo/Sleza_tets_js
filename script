@@ -1503,6 +1503,13 @@ U-47700;U-48800
   }
 
   // ── Sitemap ───────────────────────────────────
+  // Normalises CDATA-wrapped <loc> before extraction so both
+  // <loc>url</loc> and <loc><![CDATA[url]]></loc> are handled.
+  function extractLocs(xml) {
+    const normalised = xml.replace(/<loc><!\[CDATA\[([\s\S]*?)\]\]><\/loc>/gi, '<loc>$1</loc>');
+    return [...normalised.matchAll(/<loc>([^<]+)<\/loc>/g)].map(m => m[1].trim());
+  }
+
   async function trySitemap(origin) {
     const urls = [
       origin + '/sitemap.xml',
@@ -1519,8 +1526,8 @@ U-47700;U-48800
     ];
     for (const u of urls) {
       const r = await fetchUrl(u);
-      if (r.ok && r.html.includes('<loc>')) {
-        const matches = [...r.html.matchAll(/<loc>([^<]+)<\/loc>/g)].map(m => m[1].trim());
+      if (r.ok && (r.html.includes('<loc>') || r.html.includes('<loc><![CDATA['))) {
+        const matches = extractLocs(r.html);
         const filtered = matches.filter(url => url.startsWith(origin) && isHtmlUrl(url));
         const subSitemaps = matches.filter(m => m.endsWith('.xml') && m !== u);
 
@@ -1532,8 +1539,7 @@ U-47700;U-48800
             if (scanCancelled) break;
             const sr = await fetchUrl(sm);
             if (sr.ok) {
-              const sm2 = [...sr.html.matchAll(/<loc>([^<]+)<\/loc>/g)].map(m => m[1].trim());
-              subUrls.push(...sm2.filter(url => url.startsWith(origin) && isHtmlUrl(url)));
+              subUrls.push(...extractLocs(sr.html).filter(url => url.startsWith(origin) && isHtmlUrl(url)));
             }
           }
           if (subUrls.length > 0) {
@@ -2367,6 +2373,8 @@ U-47700;U-48800
 
       // ── ПРЕДФИЛЬТР: пропускаем страницы без признаков имён ──
       if (!hasNameLikePatterns(pageData.text)) {
+        // Хвост — для ЕГРЮЛ: ИНН/ОГРН часто в подвале даже у страниц без имён (/contacts, /about)
+        allPagesRawText += ' ' + pageData.text.slice(-1500);
         pages.push({
           url, title: pageData.title, items: [],
           skipped: true, // помечаем как пропущенную
@@ -3457,7 +3465,7 @@ U-47700;U-48800
       check152FZ, check149FZ, checkERIR, checkCookieCompliance,
       checkOffer, getDrugRegex, checkDrugs,
       scoreUrl, isHtmlUrl, extractYearFromUrl, strideSample, sampleByYear,
-      fetchUrl, trySitemap, crawlSite, discoverPolicyByCommonPaths,
+      fetchUrl, trySitemap, crawlSite, discoverPolicyByCommonPaths, extractLocs,
       runAIAnalysis, verify152FZWithAI,
       buildLocalChecks, plural,
       setHttpTransport, setKeyStore, saveKeys,
