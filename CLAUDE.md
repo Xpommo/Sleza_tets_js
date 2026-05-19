@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Repository shape
 
-Single-file Tampermonkey userscript at `./script` (~3400 lines, JS in a UserScript header + IIFE — no extension on purpose, that's what Tampermonkey imports). Alongside it: a vitest corpus under `tests/` that loads the script via `tests/loadScript.js` (Node `vm` context with shimmed `GM_*` and minimal DOM) and asserts against `module.exports` exposed by a guard at the end of the IIFE — the guard is a no-op in Tampermonkey.
+Single-file Tampermonkey userscript at `./script` (~3490 lines, JS in a UserScript header + IIFE — no extension on purpose, that's what Tampermonkey imports). Alongside it: a vitest corpus under `tests/` that loads the script via `tests/loadScript.js` (Node `vm` context with shimmed `GM_*` and minimal DOM) and asserts against `module.exports` exposed by a guard at the end of the IIFE — the guard is a no-op in Tampermonkey.
 
 **Run the script:** paste `script` into a new Tampermonkey userscript. The first click on the blue "СЛЕЗА // ПРОВЕРИТЬ" button opens a modal asking for `GROQ_KEY` and `SLEZA_KEY` — these are stored via `GM_setValue`, not in the file. Edit later via the `⚙ Ключи` button in the modal header.
 
@@ -16,6 +16,8 @@ Single-file Tampermonkey userscript at `./script` (~3400 lines, JS in a UserScri
 - `npx vitest run -t "<test name fragment>"` — run one test by name.
 - `npm run test:watch` — watch mode while editing logic.
 - `npm run test:ci` — what CI runs (junit reporter to `test-results.xml`).
+- `npm run test:coverage` — v8 coverage report.
+- `npm run calibrate` — offline calibration runner via Playwright (requires `npx playwright install chromium` once).
 - `RUN_SMOKE=1 GROQ_KEY=… npm test` — also runs `tests/integration/groq.smoke.test.js` against the real Groq API. Off by default.
 
 CI lives at `.github/workflows/test.yml`, runs on every push, uploads `test-results.xml` as an artifact.
@@ -30,6 +32,10 @@ The script is a single IIFE that performs a compliance audit of Russian websites
 - `api.groq.com` (llama-3.3-70b-versatile) — AI analyst for the laws Sleza doesn't cover (152-ФЗ, ЕРИР, 149-ФЗ, оферта, наркотики). Plus a second, narrower call from `verify152FZWithAI` — the AI arbiter for 152-ФЗ.
 
 All HTTP goes through `GM_xmlhttpRequest` (cross-origin bypass) — `fetch` won't work because of CSP/CORS on third-party sites. In tests this transport is replaced by a route table in `tests/mockGM.js`.
+
+**Web version:** `d:/sleza-web/` is a separate repo that loads this `script` file into a Node VM context (same technique as the tests) and wraps it behind a Fastify + Next.js stack. The web version uses two exported adapters — `setHttpTransport(fn)` (replaces `GM_xmlhttpRequest` with Node `fetch`) and `setKeyStore({get,set})` (replaces `GM_getValue`/`GM_setValue`) — plus `saveKeys` to inject Groq/Sleza keys per-request. If you rename or move these exports, update `sleza-web/backend/src/engine.js` accordingly.
+
+**Bundled script sync:** `sleza-web/backend/sleza_script` is a verbatim copy of `./script` committed into the web repo for Railway deployment. After any change to `./script`, run `cp ./script ../sleza-web/backend/sleza_script` and commit in sleza-web. Forgetting this means Railway runs stale code.
 
 ### Two scan modes
 - **Single page** (`runSinglePageScan`): reads current DOM, sends to Sleza, extracts ИНН/ОГРН, calls ЕГРЮЛ, runs AI.
@@ -50,11 +56,16 @@ Six deterministic checks are computed locally:
 - `checkERIR`, `checkOffer`, `checkCookieCompliance`, `checkDrugs` — domain-specific.
 - `parseEgrulData.isActive` — shown directly in `renderEgrulBlock`.
 
+`buildLocalChecks` accepts a `siteType` parameter (`'auto'|'media'|'services'|'ecommerce'|'saas'`). When `siteType === 'media'`, it sets offer.status = 'ok' and softens drugs.action. Other types are handled in `sleza-web/backend/src/scanner.js` via `applyServicesOverride`.
+
 In `renderAICheck`, if a card's `law_code` matches a local check, the local status replaces the AI's status.
 
 For 152-ФЗ specifically there is also an **AI arbiter**: `verify152FZWithAI` is called from `runAIAnalysis` only when the local check found 1–5 of 7 points. It sends just the missing items plus the full policy text to Groq with a narrow JSON-only prompt and **only upgrades** items the AI confirms (`confirmedBy: 'ai'`); it never downgrades. On any error it returns the local result unchanged. UI distinguishes AI-confirmed (`.sz-152-icon.ai`) from locally-found (`.sz-152-icon.ok`).
 
 When adding a new law, decide upfront: local-deterministic (preferred, no AI cost, no flakiness) or AI-evaluated (only if it requires fuzzy language understanding).
+
+### checkOffer internals
+`checkOffer` returns `{ items, found, total, status, isCommercial, kind }`. The four items have ids: `offer_exists`, `return_policy`, `seller_info`, `contact_info`. The `offer_exists` label is "Публичная оферта или договор" — note: not "присутствует" (was renamed to avoid appearing contradictory in the "Отсутствует:" list). `kind` is one of `'ecommerce'|'saas'|'services'|null`.
 
 ### Rendering
 Plain string-template HTML injected into a fixed-position modal (`#sz-ov`). CSS lives in one `GM_addStyle` block. All class names are prefixed `sz-` to avoid clashing with the host site. Two interactions worth knowing:
@@ -74,7 +85,7 @@ Plain string-template HTML injected into a fixed-position modal (`#sz-ov`). CSS 
 - AI-function tests (`runAIAnalysis`, `verify152FZWithAI`) provide both a Groq route and a catch-all `404` route, because `runAIAnalysis` calls `discoverPolicyByCommonPaths` which probes 14 URLs.
 - The smoke test against the real Groq API lives in `tests/integration/` and is excluded from the default run by `vitest.config.js`.
 
-When adding logic to a pure function, also add it to `module.exports` at the bottom of `script` — otherwise tests can't reach it.
+When adding logic to a pure function, also add it to `module.exports` at the bottom of `script` — otherwise tests can't reach it. Key exports beyond the scan functions: `setScanCancelled` (lets tests exercise cancellation paths), `setHttpTransport`, `setKeyStore`, `saveKeys` (web-migration adapters).
 
 ## Known regex traps in this codebase
 
@@ -82,6 +93,7 @@ These have already burned us; check the same shapes when adding similar code:
 - **Surrogate-pair emoji + `?`**: in non-`u`-flag JavaScript regex, `💧?` is `💧?` and *requires* the high surrogate. Wrap in `(?:💧)?` or add `u` flag.
 - **Alternation order with different lengths**: `[0-9]{10}|[0-9]{12}` matches 10 digits first and silently truncates a 12-digit number. Put the longer alternative first.
 - **Section-aware anchors**: `(?:^|\n)\s*\d+\.` is required to recognize numbered headings — without `(?:^|\n)` an inline `5.` triggers a false match.
+- **Cyrillic word boundaries**: `\b` doesn't work for Cyrillic. Use `(?:^|[\s>,.;:])` as a prefix guard instead of `\bИНН`.
 
 ## Git workflow for this repo
 
