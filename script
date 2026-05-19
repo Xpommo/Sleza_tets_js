@@ -23,8 +23,11 @@
   // Хранятся в Tampermonkey storage (GM_setValue), а не в коде.
   // Первый запуск — кнопка «СЛЕЗА // ПРОВЕРИТЬ» откроет форму ввода.
   // В дальнейшем — кнопка «⚙ Ключи» в шапке модалки.
-  const _gmGet = (typeof GM_getValue === 'function') ? GM_getValue : ((_k, d) => d);
-  const _gmSet = (typeof GM_setValue === 'function') ? GM_setValue : (() => {});
+  // Key storage: GM_getValue/GM_setValue in Tampermonkey; replaceable via setKeyStore() for web.
+  let _gmGet = (typeof GM_getValue === 'function') ? GM_getValue : ((_k, d) => d);
+  let _gmSet = (typeof GM_setValue === 'function') ? GM_setValue : (() => {});
+  function setKeyStore({ get, set }) { _gmGet = get; _gmSet = set; }
+
   let GROQ_KEY  = _gmGet('GROQ_KEY',  '');
   let SLEZA_KEY = _gmGet('SLEZA_KEY', '');
   function saveKeys(groq, sleza) {
@@ -33,6 +36,12 @@
     try { _gmSet('GROQ_KEY',  GROQ_KEY);  } catch(_) {}
     try { _gmSet('SLEZA_KEY', SLEZA_KEY); } catch(_) {}
   }
+
+  // HTTP transport: GM_xmlhttpRequest in Tampermonkey; replaceable via setHttpTransport() for web.
+  let _httpRequest = (typeof GM_xmlhttpRequest === 'function')
+    ? GM_xmlhttpRequest
+    : () => { throw new Error('[Слеза] setHttpTransport() не вызван — нет HTTP-транспорта'); };
+  function setHttpTransport(fn) { _httpRequest = fn; }
   function hasKeys() { return !!(GROQ_KEY && SLEZA_KEY); }
   // ──────────────────────────────────────────────
 
@@ -180,6 +189,7 @@
 
   // ── Запросы ───────────────────────────────────
   let scanCancelled = false;
+  function setScanCancelled(v) { scanCancelled = !!v; }
 
   function checkWithSleza(text) {
     return new Promise(resolve => {
@@ -188,7 +198,7 @@
         try { console.warn('[Слеза] SLEZA_KEY не заполнен — проверка иноагентов/экстремистов недоступна'); } catch(_) {}
         return resolve({ found: 0, items: [], errors: 'no_key' });
       }
-      GM_xmlhttpRequest({
+      _httpRequest({
         method: 'POST',
         url: 'https://sleza.media/api/parse',
         timeout: 10000,
@@ -238,7 +248,7 @@
   function checkEgrul(identifier) {
     return new Promise(resolve => {
       if (!identifier || scanCancelled) return resolve(null);
-      GM_xmlhttpRequest({
+      _httpRequest({
         method: 'GET',
         url: `https://egrul.org/${identifier}.json`,
         timeout: 8000,
@@ -1470,7 +1480,7 @@ U-47700;U-48800
   function fetchUrl(url) {
     return new Promise(resolve => {
       if (scanCancelled) return resolve({ url, ok: false, html: '', text: '' });
-      GM_xmlhttpRequest({
+      _httpRequest({
         method: 'GET', url, timeout: FETCH_TIMEOUT,
         onload(r) {
           try {
@@ -1496,6 +1506,13 @@ U-47700;U-48800
   }
 
   // ── Sitemap ───────────────────────────────────
+  // Normalises CDATA-wrapped <loc> before extraction so both
+  // <loc>url</loc> and <loc><![CDATA[url]]></loc> are handled.
+  function extractLocs(xml) {
+    const normalised = xml.replace(/<loc><!\[CDATA\[([\s\S]*?)\]\]><\/loc>/gi, '<loc>$1</loc>');
+    return [...normalised.matchAll(/<loc>([^<]+)<\/loc>/g)].map(m => m[1].trim());
+  }
+
   async function trySitemap(origin) {
     const urls = [
       origin + '/sitemap.xml',
@@ -1512,8 +1529,8 @@ U-47700;U-48800
     ];
     for (const u of urls) {
       const r = await fetchUrl(u);
-      if (r.ok && r.html.includes('<loc>')) {
-        const matches = [...r.html.matchAll(/<loc>([^<]+)<\/loc>/g)].map(m => m[1].trim());
+      if (r.ok && (r.html.includes('<loc>') || r.html.includes('<loc><![CDATA['))) {
+        const matches = extractLocs(r.html);
         const filtered = matches.filter(url => url.startsWith(origin) && isHtmlUrl(url));
         const subSitemaps = matches.filter(m => m.endsWith('.xml') && m !== u);
 
@@ -1525,8 +1542,7 @@ U-47700;U-48800
             if (scanCancelled) break;
             const sr = await fetchUrl(sm);
             if (sr.ok) {
-              const sm2 = [...sr.html.matchAll(/<loc>([^<]+)<\/loc>/g)].map(m => m[1].trim());
-              subUrls.push(...sm2.filter(url => url.startsWith(origin) && isHtmlUrl(url)));
+              subUrls.push(...extractLocs(sr.html).filter(url => url.startsWith(origin) && isHtmlUrl(url)));
             }
           }
           if (subUrls.length > 0) {
@@ -1721,6 +1737,7 @@ U-47700;U-48800
   async function crawlSite(startUrl, maxPages, maxDepth, onProgress) {
     const origin = new URL(startUrl).origin;
     const visited = new Set();
+    const queued = new Set([startUrl]); // O(1) duplicate check for the queue
     const queue = [{ url: startUrl, depth: 0 }];
     const results = [];
 
@@ -1745,7 +1762,8 @@ U-47700;U-48800
 
         const unique = [...new Set(links)];
         unique.slice(0, 20).forEach(u => {
-          if (!visited.has(u) && !queue.find(q => q.url === u)) {
+          if (!visited.has(u) && !queued.has(u)) {
+            queued.add(u);
             queue.push({ url: u, depth: depth + 1 });
           }
         });
@@ -2146,7 +2164,7 @@ U-47700;U-48800
     bd.innerHTML = `
       <div style="padding:8px 0 4px;text-align:center;color:#94a3b8;font-size:13px;line-height:1.6">
         <div style="font-family:'Courier New',monospace;font-size:10px;color:#3b82f6;letter-spacing:.1em;text-transform:uppercase;margin-bottom:6px">Что проверяем</div>
-        <div>${location.hostname}</div>
+        <div>${escapeHtml(location.hostname)}</div>
       </div>
       <div class="sz-mode">
         <div class="sz-mode-btn" id="mode-current">
@@ -2179,7 +2197,7 @@ U-47700;U-48800
       <div class="sz-progress">
         <div class="sz-spinner"></div>
         <div class="sz-prog-title">${phaseText}</div>
-        <div class="sz-prog-stage">${url ? '→ ' + url.slice(0, 80) : ''}</div>
+        <div class="sz-prog-stage">${url ? '→ ' + escapeHtml(url.slice(0, 80)) : ''}</div>
         ${total > 0 ? `<div class="sz-prog-bar"><div class="sz-prog-fill" style="width:${pct}%"></div></div>` : ''}
         <div class="sz-prog-stats">
           ${total > 0 ? `<span>${current}</span> из <span>${total}</span> страниц` : ''}
@@ -2198,6 +2216,7 @@ U-47700;U-48800
 
   // ── Сценарий: одна страница ───────────────────
   async function runSinglePageScan() {
+    SKIP_REASONS.clear();
     showProgress({ phase: 'sleza', current: 0, total: 1, url: location.href });
     const c = getCurrentPageContent();
     const fullText = `${c.title}\n${c.header}\n${c.bodyText}\n${c.footer}`;
@@ -2359,6 +2378,8 @@ U-47700;U-48800
 
       // ── ПРЕДФИЛЬТР: пропускаем страницы без признаков имён ──
       if (!hasNameLikePatterns(pageData.text)) {
+        // Хвост — для ЕГРЮЛ: ИНН/ОГРН часто в подвале даже у страниц без имён (/contacts, /about)
+        allPagesRawText += ' ' + pageData.text.slice(-1500);
         pages.push({
           url, title: pageData.title, items: [],
           skipped: true, // помечаем как пропущенную
@@ -2480,7 +2501,7 @@ U-47700;U-48800
     const user = `ПУНКТЫ ДЛЯ ПРОВЕРКИ:\n${missing.map(m => `- ${m.id}: ${m.label}`).join('\n')}\n\nТЕКСТ ПОЛИТИКИ:\n${policySnippet}`;
 
     return new Promise(resolve => {
-      GM_xmlhttpRequest({
+      _httpRequest({
         method: 'POST',
         url: 'https://api.groq.com/openai/v1/chat/completions',
         timeout: 15000,
@@ -2705,7 +2726,7 @@ U-47700;U-48800
     }
 
     return new Promise(resolve => {
-      GM_xmlhttpRequest({
+      _httpRequest({
         method: 'POST',
         url: 'https://api.groq.com/openai/v1/chat/completions',
         headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + GROQ_KEY },
@@ -2766,7 +2787,7 @@ U-47700;U-48800
 
   // Текстовые шаблоны issue/action по каждому закону на основе локальных результатов.
   // Используется когда Groq отключён или недоступен — отчёт остаётся полным.
-  function buildLocalChecks({ result152, result149, resultERIR, resultOffer, resultDrugs, resultCookie, egrul }) {
+  function buildLocalChecks({ result152, result149, resultERIR, resultOffer, resultDrugs, resultCookie, egrul, siteType = 'auto' }) {
     const out = AI_LAW_STUBS.map(s => ({ ...s }));
 
     // 1) Наркотики
@@ -2786,6 +2807,10 @@ U-47700;U-48800
         drugs.action = resultDrugs.status === 'violation'
           ? 'Удалить упоминания или добавить ссылку на статью УК / профилактический контекст. По ст.6.13 КоАП — пропаганда наркотиков'
           : 'Добавить дисклеймер или контекст (статья УК, медицинская публикация, новость о борьбе)';
+      }
+      if (siteType === 'media' && resultDrugs.hasMentions) {
+        if (resultDrugs.withoutContext < 3) { drugs.status = 'ok'; drugs.action = '—'; }
+        else if (resultDrugs.withoutContext < 5) drugs.status = 'risk';
       }
     }
 
@@ -2881,6 +2906,11 @@ U-47700;U-48800
                 ? 'Опубликовать публичную оферту на оказание услуг с порядком расторжения и реквизитами исполнителя'
                 : 'Создать публичную оферту с условиями возврата (ЗоЗПП ст.26.1 — возврат в течение 7 дней) и указать реквизиты продавца')
           : 'Дополнить оферту недостающими элементами';
+      }
+      if (siteType === 'media' && offer) {
+        offer.status = 'ok';
+        offer.issue  = 'Информационный/медиа-сайт — публичная оферта не требуется (ЗоЗПП ст.26.1 применяется только к интернет-торговле)';
+        offer.action = '—';
       }
     }
 
@@ -3448,9 +3478,11 @@ U-47700;U-48800
       hasNameLikePatterns,
       check152FZ, check149FZ, checkERIR, checkCookieCompliance,
       checkOffer, getDrugRegex, checkDrugs,
-      scoreUrl, isHtmlUrl, extractYearFromUrl,
+      scoreUrl, isHtmlUrl, extractYearFromUrl, strideSample, sampleByYear,
+      fetchUrl, trySitemap, crawlSite, discoverPolicyByCommonPaths, extractLocs,
       runAIAnalysis, verify152FZWithAI,
-      buildLocalChecks,
+      buildLocalChecks, plural,
+      setHttpTransport, setKeyStore, saveKeys, setScanCancelled,
     };
   }
 })();

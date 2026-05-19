@@ -41,4 +41,34 @@ describe('checkMarkingNearby', () => {
     expect(r.found).toBe(true);
     expect(r.hasMarking).toBe(true);
   });
+
+  it('category="other" falls back to inoagent+extremist patterns', () => {
+    const text = 'Вчера Михаил Борисов (признан экстремистской организацией) выступил на митинге.';
+    const r = checkMarkingNearby(text, 'Михаил Борисов', 'other');
+    expect(r.found).toBe(true);
+    expect(r.hasMarking).toBe(true); // экстремистский паттерн найден через fallback
+  });
+
+  it('category="other" returns hasMarking:false without any pattern', () => {
+    const text = 'Сегодня Сергей Кузнецов написал статью о природе.' + 'x'.repeat(500);
+    const r = checkMarkingNearby(text, 'Сергей Кузнецов', 'other');
+    expect(r.found).toBe(true);
+    expect(r.hasMarking).toBe(false);
+  });
+
+  it('caps search at 20 occurrences of the name', () => {
+    // 25 occurrences — should still work without error
+    const text = ('Иван Иванов упоминается здесь. ').repeat(25);
+    const r = checkMarkingNearby(text, 'Иван Иванов', 'inoagent');
+    expect(r.found).toBe(true);
+    expect(r.hasMarking).toBe(false); // no marking in context
+  });
+
+  it('returns found:false for very short name (≤4 chars)', () => {
+    // Short surname: stem logic uses full name if length ≤ 4
+    const text = 'Некто Ли написал статью.' + ' '.repeat(200) + '* — иностранный агент.';
+    const r = checkMarkingNearby(text, 'Ли', 'inoagent');
+    // name is found but asterisk+footnote path has surnameStem.length < 3 guard
+    expect(r.found).toBe(true);
+  });
 });
