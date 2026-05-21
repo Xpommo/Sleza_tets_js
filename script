@@ -560,9 +560,24 @@
       },
     ];
 
+    // Labeled address patterns — high confidence, don't need additional context
+    const LABELED_ADDRESS = [
+      /юридический\s+адрес[\s:]+[А-ЯЁ\d]/i,
+      /почтовый\s+адрес[\s:]+[А-ЯЁ\d]/i,
+      /адрес\s+(организации|компании|юр[.\s]+лица)/i,
+      /адрес[\s:]+[А-ЯЁа-яё\s,]+\s+(шоссе|проспект|набережная|ул\.|улица|бульвар)[,\s]+\d/i,
+    ];
+
     const result = { items: [], found: 0, total: checks.length, status: 'unknown' };
     for (const c of checks) {
-      const present = c.patterns.some(p => p.test(fullText));
+      let present = c.patterns.some(p => p.test(fullText));
+      // Address without an explicit label (юр. адрес, адрес компании, etc.) is too broad —
+      // city/street patterns can match article content (event locations, news). Require at
+      // least INN or company name to also be present so the address is in a requisites context.
+      if (c.id === 'address' && present && !LABELED_ADDRESS.some(p => p.test(fullText))) {
+        const hasContext = result.items.some(i => (i.id === 'inn_ogrn' || i.id === 'name') && i.present);
+        if (!hasContext) present = false;
+      }
       result.items.push({ id: c.id, label: c.label, present });
       if (present) result.found++;
     }
@@ -583,9 +598,11 @@
   // 1) Признаки рекламного контента ВООБЩЕ — есть/нет
   // 2) Если есть — проверяем erid-токен, метку "реклама", информацию о рекламодателе
   // Без AI: даёт предварительную оценку. С AI: вердикт уточняется.
-  function checkERIR(fullText) {
+  // hasAdScripts: true when ad-serving network scripts (an.yandex, adfox, soloway, etc.)
+  // are detected in the page — these indicate paid display advertising, not just analytics.
+  function checkERIR(fullText, { hasAdScripts = false } = {}) {
     if (!fullText || fullText.length < 100) {
-      return { found: 0, total: 3, items: [], status: 'unknown', hasAdContent: false };
+      return { found: 0, total: 3, items: [], status: 'unknown', hasAdContent: false, hasAdScripts };
     }
     const t = fullText.toLowerCase();
 
@@ -611,7 +628,8 @@
       }
       return false;
     };
-    const hasAdContent = adMarkers.some(p => hasPositiveAdMatch(p, t));
+    // Ad network scripts (Яндекс.Директ, Adfox, Soloway) = paid display ads → ЕРИР required
+    const hasAdContent = hasAdScripts || adMarkers.some(p => hasPositiveAdMatch(p, t));
 
     const checks = [
       {
@@ -644,7 +662,7 @@
       },
     ];
 
-    const result = { items: [], found: 0, total: checks.length, status: 'unknown', hasAdContent };
+    const result = { items: [], found: 0, total: checks.length, status: 'unknown', hasAdContent, hasAdScripts };
     for (const c of checks) {
       const present = c.patterns.some(p => p.test(fullText));
       result.items.push({ id: c.id, label: c.label, present });
@@ -2898,7 +2916,10 @@ U-47700;U-48800
         erir.action = '—';
       } else {
         const missing = resultERIR.items.filter(i => !i.present).map(i => i.label.toLowerCase()).join('; ');
-        erir.issue = `Реклама без обязательной маркировки: отсутствует ${missing}`;
+        const adSource = resultERIR.hasAdScripts && !resultERIR.items.some(i => i.id === 'ad_marker' && i.present)
+          ? ' (обнаружены скрипты рекламных сетей: Яндекс.Директ / Adfox / VK Реклама)'
+          : '';
+        erir.issue = `Реклама без обязательной маркировки: отсутствует ${missing}${adSource}`;
         erir.action = resultERIR.status === 'violation'
           ? 'Получить ERID через ОРД, добавить метку «реклама» и информацию о рекламодателе. С 01.09.2022 это обязательно'
           : 'Дополнить маркировку рекламных публикаций';

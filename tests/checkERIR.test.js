@@ -51,4 +51,28 @@ describe('checkERIR', () => {
     const r = checkERIR(PAD + ' Sponsored content by Acme Corp.');
     expect(r.hasAdContent).toBe(true);
   });
+
+  // B3: ad network script detection
+  it('B3: hasAdScripts=true → hasAdContent=true even without text markers', () => {
+    const r = checkERIR(PAD + ' Обычная страница без рекламных слов.', { hasAdScripts: true });
+    expect(r.hasAdContent).toBe(true);
+    expect(r.hasAdScripts).toBe(true);
+  });
+
+  it('B3: hasAdScripts=true, no ERID → violation', () => {
+    const r = checkERIR(PAD + ' Обычная страница.', { hasAdScripts: true });
+    expect(r.status).toBe('violation');
+  });
+
+  it('B3: hasAdScripts=true + ERID + метка + рекламодатель → ok', () => {
+    const text = PAD + ' ERID: abc1234567. Реклама. Рекламодатель: ООО "Тест", ИНН 7707083893.';
+    const r = checkERIR(text, { hasAdScripts: true });
+    expect(r.status).toBe('ok');
+  });
+
+  it('B3: hasAdScripts=false → backward compatible, text-only detection', () => {
+    const r = checkERIR(PAD + ' Обычная страница без рекламы.', { hasAdScripts: false });
+    expect(r.hasAdContent).toBe(false);
+    expect(r.status).toBe('ok');
+  });
 });

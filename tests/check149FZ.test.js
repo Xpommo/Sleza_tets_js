@@ -61,4 +61,25 @@ describe('check149FZ', () => {
     const r = check149FZ(text);
     expect(r.items.find(i => i.id === 'address').present).toBe(true);
   });
+
+  // B1: false positive prevention — city/street in article text must NOT count as legal address
+  it('B1: адрес в тексте статьи без реквизитов — не засчитывается', () => {
+    const text = `${BASE} В Екатеринбурге, ул. Ленина, 5 прошёл митинг.`;
+    expect(check149FZ(text).items.find(i => i.id === 'address').present).toBe(false);
+  });
+
+  it('B1: ул. + номер без города — не засчитывается без контекста', () => {
+    const text = `${BASE} ЖК построен на ул. Садовой, 12.`;
+    expect(check149FZ(text).items.find(i => i.id === 'address').present).toBe(false);
+  });
+
+  it('B1: г. Краснодар + ул. без реквизитов — не засчитывается', () => {
+    const text = `${BASE} г. Краснодар, ул. Красная, 17 — место события.`;
+    expect(check149FZ(text).items.find(i => i.id === 'address').present).toBe(false);
+  });
+
+  it('B1: г. Москва + ул. + ИНН → адрес засчитывается (контекст есть)', () => {
+    const text = `${BASE} ИНН: 7707083893. г. Москва, ул. Тверская, 5.`;
+    expect(check149FZ(text).items.find(i => i.id === 'address').present).toBe(true);
+  });
 });
