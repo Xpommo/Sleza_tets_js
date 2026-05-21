@@ -151,3 +151,106 @@ describe('buildLocalChecks — оферта', () => {
     expect(result.find(c => c.id === 'offer').status).toBe('violation');
   });
 });
+
+describe('buildLocalChecks — ИП (siteType=ip)', () => {
+  it('149 violation → action содержит ОГРНИП и ИНН (12 цифр)', () => {
+    const result149 = {
+      status: 'violation', found: 1, total: 5,
+      items: [
+        { id: 'inn_ogrn', label: 'ИНН или ОГРН организации', present: false },
+        { id: 'name',     label: 'Полное наименование',       present: true  },
+        { id: 'email',    label: 'Email',                     present: false },
+        { id: 'phone',    label: 'Телефон',                   present: false },
+        { id: 'address',  label: 'Адрес',                     present: false },
+      ],
+    };
+    const result = buildLocalChecks({ result149, siteType: 'ip' });
+    const c = result.find(c => c.id === 'law149');
+    expect(c.action).toContain('ОГРНИП');
+    expect(c.action).toContain('12 цифр');
+  });
+
+  it('149 violation → issue заменяет «ИНН или ОГРН организации» на ИП-формулировку', () => {
+    const result149 = {
+      status: 'violation', found: 0, total: 5,
+      items: [
+        { id: 'inn_ogrn', label: 'ИНН или ОГРН организации', present: false },
+        { id: 'name',     label: 'Полное наименование',       present: false },
+        { id: 'email',    label: 'Email',                     present: false },
+        { id: 'phone',    label: 'Телефон',                   present: false },
+        { id: 'address',  label: 'Адрес',                     present: false },
+      ],
+    };
+    const result = buildLocalChecks({ result149, siteType: 'ip' });
+    const c = result.find(c => c.id === 'law149');
+    expect(c.issue).toContain('ИНН ИП (12 цифр) или ОГРНИП');
+    expect(c.issue).not.toContain('ОГРН организации');
+  });
+
+  it('149 ok → не трогает action', () => {
+    const result149 = { status: 'ok', found: 5, total: 5, items: [] };
+    const result = buildLocalChecks({ result149, siteType: 'ip' });
+    const c = result.find(c => c.id === 'law149');
+    expect(c.status).toBe('ok');
+  });
+
+  it('offer violation для SaaS ИП → понижается до risk', () => {
+    const resultOffer = {
+      status: 'violation', isCommercial: true, kind: 'saas',
+      items: [{ id: 'offer_exists', label: 'Оферта', present: false }],
+    };
+    const result = buildLocalChecks({ resultOffer, siteType: 'ip' });
+    const c = result.find(c => c.id === 'offer');
+    expect(c.status).toBe('risk');
+    expect(c.action.toLowerCase()).toContain('пользовательское соглашение');
+  });
+
+  it('offer violation для ecommerce ИП → остаётся risk, action требует возврат', () => {
+    const resultOffer = {
+      status: 'violation', isCommercial: true, kind: 'ecommerce',
+      items: [{ id: 'offer_exists', label: 'Оферта', present: false }],
+    };
+    const result = buildLocalChecks({ resultOffer, siteType: 'ip' });
+    const c = result.find(c => c.id === 'offer');
+    expect(c.status).toBe('risk');
+    expect(c.action).toContain('ЗоЗПП ст.26.1');
+    expect(c.action).not.toContain('пользовательское соглашение заменяет');
+  });
+
+  it('152 violation → action дополняется ИП-формулировкой оператора', () => {
+    const result152 = {
+      status: 'violation', found: 2, total: 7,
+      items: [
+        { id: 'purposes',  label: 'Цели', present: true },
+        { id: 'contact',   label: 'Контакты', present: true },
+        { id: 'categories',label: 'Категории', present: false },
+        { id: 'legal_basis',label: 'Правовое основание', present: false },
+        { id: 'storage_term',label: 'Срок хранения', present: false },
+        { id: 'subject_rights',label: 'Права субъекта', present: false },
+        { id: 'third_parties',label: 'Третьи лица', present: false },
+      ],
+    };
+    const result = buildLocalChecks({ result152, siteType: 'ip' });
+    const c = result.find(c => c.id === 'law152');
+    expect(c.action).toContain('ИП Фамилия');
+  });
+
+  it('152 ok → ИП-оператор не добавляется', () => {
+    const result152 = {
+      status: 'ok', found: 7, total: 7,
+      items: Array(7).fill(null).map((_, i) => ({ id: `item${i}`, label: `item${i}`, present: true })),
+    };
+    const result = buildLocalChecks({ result152, siteType: 'ip' });
+    const c = result.find(c => c.id === 'law152');
+    expect(c.action).toBe('—');
+  });
+
+  it('siteType=auto → ИП-оверрайды не применяются', () => {
+    const resultOffer = {
+      status: 'violation', isCommercial: true, kind: 'saas',
+      items: [{ id: 'offer_exists', label: 'Оферта', present: false }],
+    };
+    const result = buildLocalChecks({ resultOffer }); // default siteType='auto'
+    expect(result.find(c => c.id === 'offer').status).toBe('violation');
+  });
+});

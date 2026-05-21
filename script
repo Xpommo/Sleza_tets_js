@@ -2947,6 +2947,49 @@ U-47700;U-48800
       }
     }
 
+    // ИП overrides: ОГРНИП вместо ОГРН, пользовательское соглашение = оферта для сервисов
+    if (siteType === 'ip') {
+      // 149-FZ: ИП указывает ОГРНИП (15 цифр) и ИНН физлица (12 цифр), не ОГРН организации
+      const law149ip = out.find(c => c.id === 'law149');
+      if (law149ip && law149ip.status !== 'ok') {
+        const egrulInactive = egrul?.result?.parsed && egrul.result.parsed.isActive === false;
+        if (!egrulInactive) {
+          if (result149?.items) {
+            const missing = result149.items
+              .filter(i => !i.present)
+              .map(i => i.id === 'inn_ogrn' ? 'ИНН ИП (12 цифр) или ОГРНИП' : i.label.toLowerCase())
+              .join('; ');
+            if (missing) law149ip.issue = `Отсутствует: ${missing}`;
+          }
+          law149ip.action = 'Опубликовать на сайте (footer или страница "Реквизиты"): ' +
+            'полное ФИО — "ИП Иванов Иван Иванович", ОГРНИП (15 цифр), ИНН (12 цифр), ' +
+            'адрес регистрации, email или телефон.';
+        }
+      }
+
+      // Оферта: пользовательское соглашение = оферта для ИП-сервисов.
+      // Для ИП-магазинов (ecommerce) условия возврата по-прежнему обязательны (ЗоЗПП ст.26.1).
+      const offerIp = out.find(c => c.id === 'offer');
+      if (offerIp && offerIp.status !== 'ok' && resultOffer?.isCommercial) {
+        if (offerIp.status === 'violation') offerIp.status = 'risk';
+        if (resultOffer.kind !== 'ecommerce') {
+          offerIp.action = 'Пользовательское соглашение заменяет публичную оферту для ИП. ' +
+            'Добавьте в соглашение: ОГРНИП, ИНН (12 цифр), адрес регистрации, email, ' +
+            'порядок расторжения. Ссылку на соглашение — в footer сайта.';
+        } else {
+          offerIp.action = 'ИП-продавец: опубликуйте оферту с условиями возврата товара ' +
+            '(ЗоЗПП ст.26.1 — 7 дней), ОГРНИП, ИНН (12 цифр) и адресом регистрации.';
+        }
+      }
+
+      // 152-FZ: оператор ПД должен быть указан как «ИП Фамилия И.О.», не название организации
+      const law152ip = out.find(c => c.id === 'law152');
+      if (law152ip && law152ip.status !== 'ok' && law152ip.action && law152ip.action !== '—' &&
+          !law152ip.action.includes('ИП Фамилия')) {
+        law152ip.action += ' Укажите оператора ПД как "ИП Фамилия И.О." вместо названия организации.';
+      }
+    }
+
     return out;
   }
 
