@@ -677,7 +677,7 @@
   // ── Чек cookie-compliance (152-ФЗ + ст.13.11 КоАП в части автоматизированной обработки) ──
   // Логика юриста: если сайт собирает cookies/использует трекинг — нужен баннер согласия.
   // Если трекинга нет — баннер не обязателен.
-  function checkCookieCompliance({ hasTracking, hasCookieBanner, policyHasCookies }) {
+  function checkCookieCompliance({ hasTracking, hasCookieBanner, policyHasCookies, hasConsentCheckbox }) {
     // Дополнительный сигнал: если в политике явно описаны cookies — это компенсирует отсутствие баннера
     if (!hasTracking) {
       return {
@@ -693,6 +693,15 @@
         status: 'ok',
         title: 'Баннер согласия на cookie присутствует',
         message: 'Трекинг обнаружен, согласие на использование cookie запрашивается у пользователя.',
+      };
+    }
+    // Форма с чекбоксом согласия — слабее баннера, но лучше ничего
+    if (hasConsentCheckbox) {
+      return {
+        hasTracking: true, hasCookieBanner: false, policyHasCookies, hasConsentCheckbox: true,
+        status: 'risk',
+        title: 'Cookie-баннер отсутствует, но форма с согласием найдена',
+        message: 'Трекинг работает, отдельного cookie-баннера нет — но на сайте найдена форма с чекбоксом согласия на обработку данных. Рекомендуется добавить cookie-баннер при первом посещении.',
       };
     }
     if (policyHasCookies) {
@@ -2806,7 +2815,7 @@ U-47700;U-48800
 
   // Текстовые шаблоны issue/action по каждому закону на основе локальных результатов.
   // Используется когда Groq отключён или недоступен — отчёт остаётся полным.
-  function buildLocalChecks({ result152, result149, resultERIR, resultOffer, resultDrugs, resultCookie, egrul, siteType = 'auto' }) {
+  function buildLocalChecks({ result152, result149, resultERIR, resultOffer, resultDrugs, resultCookie, egrul, siteType = 'auto', hasPolicyFooterLink }) {
     const out = AI_LAW_STUBS.map(s => ({ ...s }));
 
     // 1) Наркотики
@@ -2862,6 +2871,18 @@ U-47700;U-48800
         law152.action = (result152.status === 'violation'
           ? 'Переработать политику с учётом всех 7 пунктов ст.18.1 152-ФЗ.'
           : 'Дополнить отсутствующие обязательные пункты политики.') + cookieAction;
+      }
+      // Политика есть, но не ссылается из footer — нарушение требования публичной доступности.
+      // Проверяем только когда hasPolicyFooterLink явно false (undefined = поле не передано = Tampermonkey).
+      if (hasPolicyFooterLink === false && result152.status !== 'no_policy') {
+        const footerNote = ' Добавьте ссылку на политику конфиденциальности в footer сайта.';
+        if (law152.status === 'ok') {
+          law152.status = 'risk';
+          law152.issue += ' Ссылка на политику не найдена в footer.';
+          law152.action = footerNote.trim();
+        } else if (law152.action && law152.action !== '—') {
+          law152.action += footerNote;
+        }
       }
     }
 

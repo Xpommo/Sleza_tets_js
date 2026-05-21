@@ -33,6 +33,40 @@ describe('buildLocalChecks', () => {
     expect(result.find(c => c.id === 'law152').status).toBe('ok');
   });
 
+  it('152 ok + hasPolicyFooterLink=false → risk (policy not accessible from footer)', () => {
+    const result = buildLocalChecks({ result152: make152('ok', 7), resultCookie: makeCookie('ok'), hasPolicyFooterLink: false });
+    const c = result.find(c => c.id === 'law152');
+    expect(c.status).toBe('risk');
+    expect(c.action).toContain('footer');
+  });
+
+  it('152 ok + hasPolicyFooterLink=true → stays ok', () => {
+    const result = buildLocalChecks({ result152: make152('ok', 7), resultCookie: makeCookie('ok'), hasPolicyFooterLink: true });
+    expect(result.find(c => c.id === 'law152').status).toBe('ok');
+  });
+
+  it('152 ok + hasPolicyFooterLink=undefined → stays ok (Tampermonkey compat)', () => {
+    const result = buildLocalChecks({ result152: make152('ok', 7), resultCookie: makeCookie('ok') });
+    expect(result.find(c => c.id === 'law152').status).toBe('ok');
+  });
+
+  it('152 violation + hasPolicyFooterLink=false → action gets footer note appended', () => {
+    const result = buildLocalChecks({ result152: make152('violation', 2), resultCookie: makeCookie('ok'), hasPolicyFooterLink: false });
+    const c = result.find(c => c.id === 'law152');
+    expect(c.status).toBe('violation');
+    expect(c.action).toContain('footer');
+  });
+
+  it('152 no_policy + hasPolicyFooterLink=false → stays violation (no footer note for missing policy)', () => {
+    const result = buildLocalChecks({
+      result152: { status: 'no_policy', found: 0, total: 7, items: [] },
+      resultCookie: makeCookie('ok'),
+      hasPolicyFooterLink: false,
+    });
+    const c = result.find(c => c.id === 'law152');
+    expect(c.status).toBe('violation');
+  });
+
   it('152 no_policy maps to violation', () => {
     const result = buildLocalChecks({
       result152: { status: 'no_policy', found: 0, total: 7, items: [] },
