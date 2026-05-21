@@ -2626,7 +2626,16 @@ U-47700;U-48800
       if (fallbackPolicy.length > 0) fetched.policy = fallbackPolicy;
     }
 
-    let msg = `URL: ${c.url}\nЗаголовок: ${c.title}\n\nШАПКА: ${c.header}\nПОДВАЛ: ${c.footer}\n\nТЕКСТ:\n${c.bodyText}\n\nTracking: ${c.hasAdScripts?'ЕСТЬ':'нет'}\nCookie-баннер: ${c.hasCookieBanner?'ЕСТЬ':'нет'}\n`;
+    const bodySnippet = (c.bodyText || '').slice(0, 2000);
+    let msg = `=== АУДИТ: ${c.url} ===\nTracking: ${c.hasAdScripts?'ЕСТЬ':'нет'} | Cookie-баннер: ${c.hasCookieBanner?'ЕСТЬ':'нет'} | Consent-чекбокс: ${c.hasConsentCheckbox?'есть':'нет'}\n\n─── ГЛАВНАЯ СТРАНИЦА (${c.url}) ───\nЗаголовок: ${c.title}\nШапка: ${(c.header||'').slice(0,500)}\nПодвал: ${(c.footer||'').slice(0,500)}\nТекст (фрагмент): ${bodySnippet}\n`;
+
+    // Compliance pages — labeled with source URL so AI knows where each text came from.
+    // Truncated for AI prompt; full text stays in fetched.policy[i].text for local check152FZ.
+    if (fetched.policy) msg += `\n─── ПОЛИТИКА КОНФИДЕНЦИАЛЬНОСТИ ───\n${fetched.policy.map(p=>`[${p.url}]\n${p.text.slice(0,3000)}`).join('\n---\n')}\n`;
+    else msg += `\n─── ПОЛИТИКА КОНФИДЕНЦИАЛЬНОСТИ: не найдена ───\n`;
+    if (fetched.offer) msg += `\n─── ПУБЛИЧНАЯ ОФЕРТА / УСЛОВИЯ ───\n${fetched.offer.map(p=>`[${p.url}]\n${p.text.slice(0,1500)}`).join('\n---\n')}\n`;
+    else msg += `\n─── ПУБЛИЧНАЯ ОФЕРТА: не найдена ───\n`;
+    if (fetched.about) msg += `\n─── О КОМПАНИИ / РЕКВИЗИТЫ ───\n${fetched.about.map(p=>`[${p.url}]\n${p.text.slice(0,1500)}`).join('\n---\n')}\n`;
 
     // Передаём результат проверки реквизитов через ЕГРЮЛ
     if (egrul && egrul.checked) {
@@ -2653,14 +2662,6 @@ U-47700;U-48800
       }
       msg += `═══════════════════════════════════════════\n`;
     }
-
-    // Для AI-промпта политику урезаем до 3000 симв./шт. — контекст модели ограничен.
-    // Для check152FZ ниже используем ПОЛНЫЙ текст (хранится в fetched.policy[i].text).
-    if (fetched.policy) msg += `\n=== ПОЛИТИКА ===\n${fetched.policy.map(p => `${p.url}\n${p.text.slice(0, 3000)}`).join('\n---\n')}\n`;
-    else msg += `\n[ПОЛИТИКА: не найдена]\n`;
-    if (fetched.offer) msg += `\n=== ОФЕРТА ===\n${fetched.offer.map(p => `${p.url}\n${p.text.slice(0,1500)}`).join('\n---\n')}\n`;
-    else msg += `\n[ОФЕРТА: не найдена]\n`;
-    if (fetched.about) msg += `\n=== О КОМПАНИИ ===\n${fetched.about.map(p => `${p.url}\n${p.text.slice(0,1500)}`).join('\n---\n')}\n`;
 
     // ── Локальный чек-лист 152-ФЗ ст.18.1 (7 пунктов) ──
     const policyText = (fetched.policy || []).map(p => p.text).join('\n\n');
