@@ -41,7 +41,7 @@ All HTTP goes through `GM_xmlhttpRequest` (cross-origin bypass) — `fetch` won'
 3. **Local prefilter**: `hasNameLikePatterns` — regex check for FIO/quoted titles/citation verbs. If false, the page is marked `skipped` and the Sleza API call is **not made and the 1.1s delay is skipped**. Major cost optimization — keep it.
 4. **Sleza scan**: one request per surviving page; results parsed by `parseSlezaItem` and contextualized by `checkMarkingNearby` (looks ±200/+400 chars around each name occurrence for `MARK_RE` patterns; also checks star+footnote and document tail).
 5. **ЕГРЮЛ verification**: `extractIdentifiers` greps text for ИНН (12/10 digits) and ОГРН/ОГРНИП (15/13 digits) — alternation order matters, longer first, otherwise ИП identifiers are truncated. Then `checkEgrul` → `parseEgrulData` (defensive — FNS returns several shapes: `СвЮЛ`, flat `НаимЮЛПолн`, `СвИП`, flat `ОГРНИП`).
-6. **AI pass**: `runAIAnalysis` fetches up to 4 policy/offer/return/about sub-pages; if no policy was found it falls back to `discoverPolicyByCommonPaths` which probes 14 common URL paths in two waves. Then packs everything plus ЕГРЮЛ verdict plus the local 152-ФЗ checklist into a single prompt, expects strict JSON back. If `GROQ_KEY` is empty or `USE_AI=false`, returns a local-only report assembled by `buildLocalChecks`.
+6. **AI pass**: `runAIAnalysis` fetches up to 4 policy/offer/return/about sub-pages; if no policy was found it falls back to `discoverPolicyByCommonPaths` which probes 14 common URL paths in two waves. Prompt structure (D2, 2026-05-21): main page compact header → compliance pages **labeled with source URL** → EGRUL block → local checklists. `bodyText` is trimmed to 2000 chars in the prompt (full text already used by local checks). `hasConsentCheckbox` is included in the meta line. If `GROQ_KEY` is empty or `USE_AI=false`, returns a local-only report assembled by `buildLocalChecks`.
 
 ### Local checks, AI overrides, and the 152-ФЗ arbiter
 Six deterministic checks are computed locally:
@@ -85,7 +85,7 @@ These have already burned us; check the same shapes when adding similar code:
 
 ## Git workflow for this repo
 
-- Develop on `claude/improve-compliance-checker-HjMh0`. `main` is the published baseline.
-- Push with `git push -u origin claude/improve-compliance-checker-HjMh0`. Do not push to `main` without explicit user request.
-- GitHub access is via the `mcp__github__*` MCP tools, scoped to `xpommo/sleza_tets_js`. `gh` CLI is not available.
+- Active branch: `main` (all fixes merged here directly).
+- Push with `git push origin main`.
+- After changes to `script`, update the bundled copy in sleza-web: `cp ~/sleza_tets_js/script ~/sleza-web/backend/sleza_script`
 - Do not open PRs unless the user asks.
