@@ -59,8 +59,13 @@ describe('checkERIR', () => {
     expect(r.hasAdScripts).toBe(true);
   });
 
-  it('B3: hasAdScripts=true, no ERID → violation', () => {
+  it('B3: hasAdScripts=true without text ad markers → risk (retargeting/analytics, not hosted ads)', () => {
     const r = checkERIR(PAD + ' Обычная страница.', { hasAdScripts: true });
+    expect(r.status).toBe('risk');
+  });
+
+  it('B3: hasAdScripts=true WITH text ad markers but no ERID → violation', () => {
+    const r = checkERIR(PAD + ' Партнёрский материал. На правах рекламы.', { hasAdScripts: true });
     expect(r.status).toBe('violation');
   });
 

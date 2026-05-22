@@ -629,7 +629,8 @@
       return false;
     };
     // Ad network scripts (Яндекс.Директ, Adfox, Soloway) = paid display ads → ЕРИР required
-    const hasAdContent = hasAdScripts || adMarkers.some(p => hasPositiveAdMatch(p, t));
+    const hasAdMarkerInContent = adMarkers.some(p => hasPositiveAdMatch(p, t));
+    const hasAdContent = hasAdScripts || hasAdMarkerInContent;
 
     const checks = [
       {
@@ -670,15 +671,18 @@
     }
 
     // Логика статуса:
-    // - Нет рекламного контента → ok (реклама не используется, маркировка не требуется)
-    // - Есть реклама и все 3 признака → ok
-    // - Есть реклама и 2 из 3 → risk
-    // - Есть реклама и <2 → violation
+    // - Нет рекламного контента → ok
+    // - Есть реклама, все 3 признака → ok
+    // - Есть реклама, 2 из 3 → risk
+    // - Только скрипты без текстовых маркеров → risk (ретаргетинг/аналитика, не показ сторонней рекламы)
+    // - Есть текстовые маркеры рекламы, <2 признака → violation
     if (!hasAdContent) {
       result.status = 'ok';
     } else if (result.found === 3) {
       result.status = 'ok';
     } else if (result.found >= 2) {
+      result.status = 'risk';
+    } else if (hasAdScripts && !hasAdMarkerInContent) {
       result.status = 'risk';
     } else {
       result.status = 'violation';
