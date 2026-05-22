@@ -663,7 +663,7 @@
       },
     ];
 
-    const result = { items: [], found: 0, total: checks.length, status: 'unknown', hasAdContent, hasAdScripts };
+    const result = { items: [], found: 0, total: checks.length, status: 'unknown', hasAdContent, hasAdScripts, hasAdMarkerInContent };
     for (const c of checks) {
       const present = c.patterns.some(p => p.test(fullText));
       result.items.push({ id: c.id, label: c.label, present });
@@ -2611,6 +2611,74 @@ U-47700;U-48800
     });
   }
 
+  // ── AI-верификация ЕРИР: уточняет, действительно ли сайт размещает платную рекламу третьих лиц.
+  // Вызывается только когда hasAdScripts=true + нет текстовых маркеров рекламы (status='risk').
+  // Цель: убрать false positive для SaaS/аналитики, которые используют скрипты Яндекс.Директ
+  // для отслеживания собственных кампаний, но не показывают стороннюю рекламу.
+  async function verifyERIRWithAI(pageCtx, resultERIR) {
+    // Только неоднозначный случай: скрипты есть, текстовой рекламы нет
+    if (!resultERIR.hasAdScripts || resultERIR.hasAdMarkerInContent) return resultERIR;
+    if (resultERIR.status !== 'risk') return resultERIR;
+    if (scanCancelled) return resultERIR;
+
+    const system = `Ты эксперт по российскому рекламному законодательству (ФЗ №347 об ЕРИР/маркировке рекламы).
+На сайте обнаружены скрипты рекламных сетей (Яндекс.Директ, Adfox, Soloway и т.п.), но текстовых признаков рекламного контента нет.
+Определи: ДЕЙСТВИТЕЛЬНО ли этот сайт размещает платную рекламу третьих лиц, требующую маркировки ERID,
+или скрипты используются для аналитики и отслеживания собственных рекламных кампаний.
+
+SaaS-платформы, системы аналитики, B2B-сервисы часто используют эти скрипты для измерения
+эффективности собственного продвижения — но НЕ показывают рекламу сторонних рекламодателей.
+
+Верни ТОЛЬКО JSON без пояснений:
+{"has_paid_advertising": true|false, "confidence": "high"|"medium"|"low", "reason": "<1 предложение>"}
+- has_paid_advertising: true — сайт показывает платные баннеры/материалы от третьих рекламодателей
+- has_paid_advertising: false — скрипты используются для аналитики/ретаргетинга собственного продвижения
+- confidence: high — уверен; medium/low — есть сомнения`;
+
+    const bodySnippet = (pageCtx.bodyText || '').slice(0, 1500);
+    const user = `САЙТ: ${pageCtx.url}
+Заголовок: ${pageCtx.title || '—'}
+Шапка: ${(pageCtx.header || '').slice(0, 400)}
+Подвал: ${(pageCtx.footer || '').slice(0, 400)}
+Текст страницы (фрагмент): ${bodySnippet}`;
+
+    return new Promise(resolve => {
+      _httpRequest({
+        method: 'POST',
+        url: 'https://api.groq.com/openai/v1/chat/completions',
+        timeout: 12000,
+        headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + GROQ_KEY },
+        data: JSON.stringify({
+          model: 'llama-3.3-70b-versatile',
+          max_tokens: 150,
+          temperature: 0,
+          messages: [
+            { role: 'system', content: system },
+            { role: 'user',   content: user }
+          ]
+        }),
+        onload(r) {
+          try {
+            const j = JSON.parse(r.responseText);
+            if (j.error) return resolve(resultERIR);
+            const txt = j.choices?.[0]?.message?.content || '';
+            const m = txt.match(/\{[\s\S]*\}/);
+            if (!m) return resolve(resultERIR);
+            const parsed = JSON.parse(m[0]);
+            if (parsed.has_paid_advertising === false && parsed.confidence === 'high') {
+              return resolve({ ...resultERIR, status: 'ok', verifiedBy: 'ai', aiReason: String(parsed.reason || '').slice(0, 200) });
+            }
+            resolve(resultERIR);
+          } catch (e) {
+            resolve(resultERIR);
+          }
+        },
+        onerror()   { resolve(resultERIR); },
+        ontimeout() { resolve(resultERIR); },
+      });
+    });
+  }
+
   async function runAIAnalysis(c, egrul, siteText, siteType = 'auto') {
     // Загружаем подстраницы политики/оферты для AI
     const allLinks = [...c.policyLinks, ...c.offerLinks, ...c.returnLinks, ...c.aboutLinks];
@@ -2715,15 +2783,23 @@ U-47700;U-48800
     msg += `═══════════════════════════════════════════\n`;
 
     // ── Локальный чек-лист ЕРИР (ФЗ №347): маркировка интернет-рекламы ──
-    const resultERIR = checkERIR(text149);
+    let resultERIR = checkERIR(text149, { hasAdScripts: !!c.hasAdScripts });
+    // AI-верификация: если только скрипты без текстовых маркеров (SaaS/аналитика false positive) — уточняем у AI
+    if (groqForArbiter && resultERIR.status === 'risk' && resultERIR.hasAdScripts && !resultERIR.hasAdMarkerInContent) {
+      resultERIR = await verifyERIRWithAI(c, resultERIR);
+    }
     msg += `\n═══ ЛОКАЛЬНЫЙ ЧЕК-ЛИСТ ЕРИР (ФЗ №347) ═══\n`;
     msg += `Рекламный контент: ${resultERIR.hasAdContent ? 'ОБНАРУЖЕН' : 'не обнаружен'}\n`;
-    if (resultERIR.hasAdContent) {
+    if (resultERIR.verifiedBy === 'ai' && resultERIR.status === 'ok') {
+      msg += `AI-верификация: платная реклама третьих лиц не обнаружена — скрипты используются для аналитики/ретаргетинга\n`;
+      if (resultERIR.aiReason) msg += `Причина: ${resultERIR.aiReason}\n`;
+    } else if (resultERIR.hasAdContent) {
       resultERIR.items.forEach(item => {
         msg += `${item.present ? '✓' : '✗'} ${item.label}\n`;
       });
     }
     msg += `Локальный вывод: ${resultERIR.status === 'ok' ? (resultERIR.hasAdContent ? 'реклама маркирована корректно' : 'рекламы не обнаружено') : resultERIR.status === 'risk' ? 'есть рекламный контент, но маркировка неполная' : 'реклама без обязательной маркировки'}\n`;
+    msg += `→ Используй этот результат как ОСНОВУ для ЕРИР. Не пересчитывай заново.\n`;
     msg += `═══════════════════════════════════════════\n`;
 
     // ── Локальный чек-лист публичной оферты (ГК РФ ст.435, ЗоЗПП ст.26.1) ──
@@ -2924,6 +3000,9 @@ U-47700;U-48800
       erir.status = resultERIR.status;
       if (!resultERIR.hasAdContent) {
         erir.issue = 'Рекламного контента не обнаружено';
+        erir.action = '—';
+      } else if (resultERIR.status === 'ok' && resultERIR.verifiedBy === 'ai') {
+        erir.issue = 'Рекламные скрипты используются для аналитики собственных кампаний — платная реклама третьих лиц не обнаружена' + (resultERIR.aiReason ? `: ${resultERIR.aiReason}` : '');
         erir.action = '—';
       } else if (resultERIR.status === 'ok') {
         erir.issue = 'Реклама маркирована корректно: токен ERID, метка «реклама», информация о рекламодателе';
@@ -3612,7 +3691,7 @@ U-47700;U-48800
       checkOffer, getDrugRegex, checkDrugs,
       scoreUrl, isHtmlUrl, extractYearFromUrl, strideSample, sampleByYear,
       fetchUrl, trySitemap, crawlSite, discoverPolicyByCommonPaths, extractLocs,
-      runAIAnalysis, verify152FZWithAI,
+      runAIAnalysis, verify152FZWithAI, verifyERIRWithAI,
       buildLocalChecks, plural,
       setHttpTransport, setKeyStore, saveKeys, setScanCancelled,
     };
