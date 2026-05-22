@@ -2607,7 +2607,7 @@ U-47700;U-48800
     });
   }
 
-  async function runAIAnalysis(c, egrul, siteText) {
+  async function runAIAnalysis(c, egrul, siteText, siteType = 'auto') {
     // Загружаем подстраницы политики/оферты для AI
     const allLinks = [...c.policyLinks, ...c.offerLinks, ...c.returnLinks, ...c.aboutLinks];
     const fetched = {};
@@ -2636,7 +2636,7 @@ U-47700;U-48800
     }
 
     const bodySnippet = (c.bodyText || '').slice(0, 2000);
-    let msg = `=== АУДИТ: ${c.url} ===\nTracking: ${c.hasAdScripts?'ЕСТЬ':'нет'} | Cookie-баннер: ${c.hasCookieBanner?'ЕСТЬ':'нет'} | Consent-чекбокс: ${c.hasConsentCheckbox?'есть':'нет'}\n\n─── ГЛАВНАЯ СТРАНИЦА (${c.url}) ───\nЗаголовок: ${c.title}\nШапка: ${(c.header||'').slice(0,500)}\nПодвал: ${(c.footer||'').slice(0,500)}\nТекст (фрагмент): ${bodySnippet}\n`;
+    let msg = `=== АУДИТ: ${c.url} ===\nТип сайта: ${siteType || 'auto'}\nTracking: ${c.hasAdScripts?'ЕСТЬ':'нет'} | Cookie-баннер: ${c.hasCookieBanner?'ЕСТЬ':'нет'} | Consent-чекбокс: ${c.hasConsentCheckbox?'есть':'нет'}\n\n─── ГЛАВНАЯ СТРАНИЦА (${c.url}) ───\nЗаголовок: ${c.title}\nШапка: ${(c.header||'').slice(0,500)}\nПодвал: ${(c.footer||'').slice(0,500)}\nТекст (фрагмент): ${bodySnippet}\n`;
 
     // Compliance pages — labeled with source URL so AI knows where each text came from.
     // Truncated for AI prompt; full text stays in fetched.policy[i].text for local check152FZ.
