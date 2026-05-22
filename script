@@ -1952,23 +1952,32 @@ U-47700;U-48800
   }
 
   // ── AI промпт (для остальных законов) ────────
-  const SYSTEM = `Ты эксперт по российскому digital compliance.
-Маркировка иноагентов/экстремистов проверена через API Слезы — НЕ оценивай её, оценивай только остальные законы.
+  const SYSTEM = `Ты эксперт по российскому digital compliance. Твоя задача — аудит российских сайтов на соответствие законодательству.
 
-Правила:
-- ok: требование выполнено
-- risk: возможное нарушение
-- violation: явное нарушение
-- unknown: нет данных
+ВАЖНО — локальные чек-листы:
+В сообщении пользователя есть готовые локальные чек-листы (152-ФЗ, 149-ФЗ, ЕРИР, Оферта, Cookie, Наркотики).
+Они вычислены детерминированными алгоритмами — НЕ пересчитывай их заново, используй как основу.
+Твоя роль — интерпретировать результаты, заполнить issue/action/location/found_text и скорректировать статус только если есть явное противоречие с текстом.
 
-Если контент политики/оферты есть — это НЕ нарушение.
-Не уверен — ставь "ok" или "unknown", НЕ "violation".
+Маркировка иноагентов/экстремистов проверена через API Слезы — НЕ оценивай её.
 
-Верни ТОЛЬКО JSON:
+Правила статусов:
+- "ok": требование явно выполнено (документ есть, реквизиты найдены, маркировка присутствует)
+- "risk": требование, возможно, не выполнено, но данных недостаточно для однозначного вывода
+- "violation": явное нарушение — документ/реквизиты/маркировка отсутствуют при очевидной обязанности
+- "unknown": данных недостаточно для любого вывода (сайт недоступен, контент не загружен)
+Не уверен → "risk" или "unknown", НЕ "violation". Презумпция соответствия.
+
+Поля found_text и location:
+- found_text: дословная короткая цитата из текста сайта, подтверждающая вывод. Если нарушение — цитата отсутствующего элемента не нужна, оставь "". Если соответствие — процитируй ключевую фразу.
+- location: где именно на сайте (footer, /privacy, /oferta, шапка, подвал). Если не найдено — "не обнаружено".
+- found_url: URL страницы где найдено (из секций ПОЛИТИКА/ОФЕРТА/О КОМПАНИИ выше), или "".
+
+Верни ТОЛЬКО валидный JSON без пояснений:
 {
-  "site_name":"...","site_type":"...","summary":"2-3 предложения",
+  "site_name":"...","site_type":"ecommerce|media|saas|services|ip|auto","summary":"2-3 предложения об общем статусе",
   "checks":[
-    {"law":"Упоминание наркотиков","law_code":"ст.6.13 КоАП, ФЗ №3","status":"violation|risk|ok|unknown","issue":"...","location":"...","found_text":"...","found_url":"","fine":"до 1 500 000 руб.","action":"..."},
+    {"law":"Упоминание наркотиков","law_code":"ст.6.13 КоАП, ФЗ №3","status":"ok|risk|violation|unknown","issue":"кратко что не так или что в порядке","location":"где на сайте","found_text":"цитата или пусто","found_url":"","fine":"до 1 500 000 руб.","action":"конкретный шаг для исправления или —"},
     {"law":"152-ФЗ — персональные данные","law_code":"152-ФЗ, ст.13.11 КоАП","status":"...","issue":"...","location":"...","found_text":"...","found_url":"","fine":"до 300 000 руб.","action":"..."},
     {"law":"Маркировка рекламы (ЕРИР)","law_code":"ФЗ №347, ст.14.3 КоАП","status":"...","issue":"...","location":"...","found_text":"...","found_url":"","fine":"100 000 — 500 000 руб.","action":"..."},
     {"law":"149-ФЗ — информация о владельце","law_code":"149-ФЗ ст.10, ст.13.31 КоАП","status":"...","issue":"...","location":"...","found_text":"...","found_url":"","fine":"до 100 000 руб.","action":"..."},
@@ -2772,20 +2781,19 @@ U-47700;U-48800
       };
     }
 
-    return new Promise(resolve => {
+    const groqPayload = JSON.stringify({
+      model: 'llama-3.3-70b-versatile',
+      max_tokens: 2500,
+      temperature: 0.1,
+      messages: [{ role: 'system', content: SYSTEM }, { role: 'user', content: msg }],
+    });
+
+    const tryGroq = () => new Promise(resolve => {
       _httpRequest({
         method: 'POST',
         url: 'https://api.groq.com/openai/v1/chat/completions',
         headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + GROQ_KEY },
-        data: JSON.stringify({
-          model: 'llama-3.3-70b-versatile',
-          max_tokens: 2500,
-          temperature: 0.1,
-          messages: [
-            { role: 'system', content: SYSTEM },
-            { role: 'user', content: msg }
-          ]
-        }),
+        data: groqPayload,
         onload(r) {
           try {
             const j = JSON.parse(r.responseText);
@@ -2793,24 +2801,25 @@ U-47700;U-48800
             const txt = j.choices?.[0]?.message?.content || '';
             const m = txt.match(/\{[\s\S]*\}/);
             if (!m) throw new Error('parse');
-            const parsed = JSON.parse(m[0]);
-            resolve({ ...parsed, fetched, result152, result149, resultERIR, resultOffer, resultDrugs, resultCookie });
-          } catch(e) {
-            // Groq упал/rate-limit/parse — собираем отчёт из локальных результатов, не теряем данные
-            const localChecks = buildLocalChecks({ result152, result149, resultERIR, resultOffer, resultDrugs, resultCookie, egrul });
-            resolve({ error: e.message, checks: localChecks, summary: 'Groq недоступен — отчёт собран из локальных проверок.', fetched, result152, result149, resultERIR, resultOffer, resultDrugs, resultCookie });
-          }
+            resolve({ ok: true, parsed: JSON.parse(m[0]) });
+          } catch(e) { resolve({ ok: false, error: e.message }); }
         },
-        onerror() {
-          const localChecks = buildLocalChecks({ result152, result149, resultERIR, resultOffer, resultDrugs, resultCookie, egrul });
-          resolve({ error: 'net', checks: localChecks, summary: 'Groq недоступен (сетевая ошибка) — отчёт собран из локальных проверок.', fetched, result152, result149, resultERIR, resultOffer, resultDrugs, resultCookie });
-        },
-        ontimeout() {
-          const localChecks = buildLocalChecks({ result152, result149, resultERIR, resultOffer, resultDrugs, resultCookie, egrul });
-          resolve({ error: 'timeout', checks: localChecks, summary: 'Groq не ответил вовремя — отчёт собран из локальных проверок.', fetched, result152, result149, resultERIR, resultOffer, resultDrugs, resultCookie });
-        }
+        onerror()   { resolve({ ok: false, error: 'net' }); },
+        ontimeout() { resolve({ ok: false, error: 'timeout' }); },
       });
     });
+
+    // Retry up to 2 attempts with 3s backoff — handles Groq rate-limit spikes
+    let lastErr = '';
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      if (attempt > 1) await new Promise(r => setTimeout(r, 3000));
+      const res = await tryGroq();
+      if (res.ok) return { ...res.parsed, fetched, result152, result149, resultERIR, resultOffer, resultDrugs, resultCookie };
+      lastErr = res.error;
+    }
+    // Both attempts failed — fall back to local checks, no data is lost
+    const localChecks = buildLocalChecks({ result152, result149, resultERIR, resultOffer, resultDrugs, resultCookie, egrul });
+    return { error: lastErr, checks: localChecks, summary: 'Groq недоступен — отчёт собран из локальных проверок.', fetched, result152, result149, resultERIR, resultOffer, resultDrugs, resultCookie };
   }
 
   const ST = {
